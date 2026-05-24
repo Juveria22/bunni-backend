@@ -48,7 +48,6 @@ def _make_response(body: str, channel: str, to_number: str) -> MessagingResponse
     return resp
 
 ONBOARDING_MSG = (
-    "hey"
     "gcal setup: {auth_url}"
 )
 
