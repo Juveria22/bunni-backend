@@ -48,8 +48,8 @@ def _make_response(body: str, channel: str, to_number: str) -> MessagingResponse
     return resp
 
 ONBOARDING_MSG = (
-    "hey "
-    "connect ur gcal to get started: {auth_url}"
+    "hey"
+    "gcal setup: {auth_url}"
 )
 
 ALREADY_ONBOARDED_MSG = (
