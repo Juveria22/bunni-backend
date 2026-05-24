@@ -22,7 +22,8 @@ from db.repo import get_or_create_user
 from services.google_oauth import generate_auth_url, get_calendar_service_for_user
 from services.agent import run_agent
 from services.rate_limit import check_rate_limit
-from services.sms import send_sms, send_vcard
+from services.sms import send_sms
+#, send_vcard
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -92,7 +93,7 @@ async def receive_message(
         # New user, send onboarding link
         if not user.is_onboarded:
             auth_url = generate_auth_url(phone)
-            await send_vcard(phone)
+            #await send_vcard(phone)
             msg = ONBOARDING_MSG.format(auth_url=auth_url)
             resp = _make_response(msg, channel, phone)
             logger.info(f"Sent onboarding link to {phone} via {channel}")
