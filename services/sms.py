@@ -28,6 +28,13 @@ async def send_message(to: str, body: str, channel: str = "sms") -> None:
             body=body,
         )
 
+def _make_vcard() -> str:
+    number = TWILIO_PHONE_NUMBER  # add this import from services.sms or os.environ
+    return f"""BEGIN:VCARD
+VERSION:3.0
+FN:gcal
+TEL;TYPE=CELL:{number}
+END:VCARD"""
 
 # Convenience alias, defaults to SMS so existing callers don't break
 async def send_sms(to: str, body: str) -> None:

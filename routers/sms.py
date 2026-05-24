@@ -47,9 +47,15 @@ def _make_response(body: str, channel: str, to_number: str) -> MessagingResponse
         msg.sender = WHATSAPP_NUMBER
     return resp
 
-ONBOARDING_MSG = (
-    "gcal setup: {auth_url}"
-)
+def _make_vcard() -> str:
+    number = TWILIO_PHONE_NUMBER  # add this import from services.sms or os.environ
+    return f"""BEGIN:VCARD
+VERSION:3.0
+FN:gcal
+TEL;TYPE=CELL:{number}
+END:VCARD"""
+
+ONBOARDING_MSG = "heyy\n\ngcal setup: {auth_url}"
 
 ALREADY_ONBOARDED_MSG = (
     "u're connected just txt me what you want on ur gcal"
@@ -85,6 +91,7 @@ async def receive_message(
         # New user, send onboarding link
         if not user.is_onboarded:
             auth_url = generate_auth_url(phone)
+            await send_vcard(phone)
             msg = ONBOARDING_MSG.format(auth_url=auth_url)
             resp = _make_response(msg, channel, phone)
             logger.info(f"Sent onboarding link to {phone} via {channel}")
