@@ -10,11 +10,11 @@ Follow the instructions below to recreate/contribute to this project
 
 before making changes to the code, create accounts on these four services. all have free tiers.
 
-- **Railway** — railway.app (hosts your server + redis)
-- **Supabase** — supabase.com (postgres database)
-- **Twilio** — twilio.com (phone number + SMS)
-- **Google Cloud** — console.cloud.google.com (calendar API access)
-- **Anthropic** — console.anthropic.com (Claude API)
+- **Railway** - railway.app (hosts your server + redis)
+- **Supabase** - supabase.com (postgres database)
+- **Twilio** - twilio.com (phone number + SMS)
+- **Google Cloud** - console.cloud.google.com (calendar API access)
+- **Anthropic** - console.anthropic.com (Claude API)
 
 ---
 
