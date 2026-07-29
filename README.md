@@ -1,12 +1,14 @@
-# gcal agent
+# bunni backend 
 
-text a number, it adds stuff to your google calendar. anyone can use it.
+Text a number, and it adds events to Google Calendar! 
+
+Follow the instructions below to recreate/contribute to this project 
 
 ---
 
 ## what you need accounts for
 
-before touching any code, create accounts on these four services. all have free tiers.
+before making changes to the code, create accounts on these four services. all have free tiers.
 
 - **Railway** — railway.app (hosts your server + redis)
 - **Supabase** — supabase.com (postgres database)
