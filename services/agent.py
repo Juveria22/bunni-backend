@@ -35,10 +35,12 @@ client = anthropic.AsyncAnthropic()
 # The normal 60-minute default would fire at 11pm the previous night.
 ALL_DAY_REMINDER_MINUTES = 900
 
-# Twilio gives a webhook ~15s before it gives up, and every model call plus
-# google call spends some of it. Cap the whole loop well inside that.
-AGENT_DEADLINE_SECONDS = 11.0
-MAX_MODEL_CALLS = 3
+# Replies go out over the rest api after the webhook has returned, so Twilio's
+# ~15s timeout no longer bounds this. The cap is now about not leaving someone
+# staring at their phone, and about not looping forever on a bad day.
+# 4 calls is enough to search, widen the search once, then act.
+AGENT_DEADLINE_SECONDS = 30.0
+MAX_MODEL_CALLS = 4
 
 TOOLS = [
     {

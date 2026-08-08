@@ -3,6 +3,7 @@ Google Calendar operations. Every function takes a `service` object
 that's already scoped to a specific user's credentials.
 """
 
+import asyncio
 import logging
 from datetime import datetime, time, timedelta, timezone
 from typing import Optional
@@ -12,6 +13,15 @@ from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 CALENDAR_ID = "primary"
+
+
+async def _execute(request):
+    """
+    Google's python client is synchronous. Calling .execute() directly from a
+    coroutine blocks the whole event loop for the length of the http round
+    trip, which stalls every other user's webhook. Hand it to a thread.
+    """
+    return await asyncio.to_thread(request.execute)
 
 # Users are in eastern time. This must be a named zone, not a fixed offset —
 # a hardcoded -04:00 is EDT and silently books everything an hour early once
@@ -118,11 +128,11 @@ async def update_event_time(
     switching a timed event to all-day drops its dateTime rather than leaving
     a stale one behind.
     """
-    event = service.events().patch(
+    event = await _execute(service.events().patch(
         calendarId=CALENDAR_ID,
         eventId=event_id,
         body=build_time_body(date, start_time, duration_minutes, all_day, end_date),
-    ).execute()
+    ))
     logger.info(f"Moved event {event_id} to {date} {start_time or '(all day)'}")
     return event
 
@@ -145,14 +155,14 @@ async def find_conflicting_events(
     reporting it as a clash with itself.
     """
     excluded = exclude_event_ids or set()
-    result = service.events().list(
+    result = await _execute(service.events().list(
         calendarId=CALENDAR_ID,
         timeMin=start_dt.isoformat(),
         timeMax=end_dt.isoformat(),
         singleEvents=True,
         orderBy="startTime",
         maxResults=max_results,
-    ).execute()
+    ))
 
     conflicts = []
     for event in result.get("items", []):
@@ -205,17 +215,17 @@ async def create_event(
     if location:    body["location"] = location
     if description: body["description"] = description
 
-    event = service.events().insert(calendarId=CALENDAR_ID, body=body).execute()
+    event = await _execute(service.events().insert(calendarId=CALENDAR_ID, body=body))
     logger.info(f"Created event: {event['id']} — {title}")
     return event
 
 
 async def get_event(service, event_id: str) -> dict:
-    return service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    return await _execute(service.events().get(calendarId=CALENDAR_ID, eventId=event_id))
 
 
 async def delete_event(service, event_id: str) -> None:
-    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    await _execute(service.events().delete(calendarId=CALENDAR_ID, eventId=event_id))
     logger.info(f"Deleted event {event_id}")
 
 
@@ -243,7 +253,7 @@ async def list_events(
     if query:
         params["q"] = query
 
-    result = service.events().list(**params).execute()
+    result = await _execute(service.events().list(**params))
     return [e for e in result.get("items", []) if e.get("status") != "cancelled"]
 
 
@@ -281,11 +291,11 @@ async def update_event_reminders(service, event_ids: list[str], reminder_minutes
 
     for event_id in event_ids:
         try:
-            service.events().patch(
+            await _execute(service.events().patch(
                 calendarId=CALENDAR_ID,
                 eventId=event_id,
                 body=body,
-            ).execute()
+            ))
             logger.info(f"Updated reminders on {event_id}")
             updated += 1
         except HttpError as e:
