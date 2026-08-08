@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated: June 13, 2026**
+**Last updated: August 7, 2026**
 
 ## Overview
 
@@ -11,6 +11,7 @@ gcal agent ("we", "us", "our") operates an AI-powered SMS calendar assistant. Th
 - **Phone number** — used to identify you and send SMS replies
 - **Google account email** — collected when you connect your Google Calendar
 - **Google Calendar access** — we read and write to your calendar on your behalf via OAuth2
+- **Message history** — the text you send us and our replies, so the assistant can understand follow-up messages
 
 ## How We Use Your Information
 
@@ -20,7 +21,11 @@ gcal agent ("we", "us", "our") operates an AI-powered SMS calendar assistant. Th
 
 ## Data Storage
 
-Your phone number and Google OAuth refresh token are stored securely in an encrypted database. We do not store your calendar event content beyond what is needed to process your request.
+Your phone number and Google OAuth refresh token are stored securely in an encrypted database.
+
+We also store the messages you exchange with us — your texts and our replies — in that same database. This is what lets the assistant understand follow-ups like "make it 3pm instead" or answer a question it asked you. Only the most recent messages are ever sent back to the AI model; older ones stay at rest until deleted.
+
+We do not store your calendar event content itself. Note that a message you send may describe an event, and that message text is stored as described above.
 
 ## Data Sharing
 
@@ -45,7 +50,7 @@ Reply **STOP** to unsubscribe at any time. Reply **HELP** for help.
 
 ## Data Retention
 
-We retain your data for as long as you have an active account. To delete your data, reply STOP or contact us at the email below.
+We retain your data, including your message history, for as long as you have an active account. To delete your data, reply STOP or contact us at the email below. Deleting your account deletes your stored messages along with it.
 
 ## Security
 

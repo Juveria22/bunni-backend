@@ -18,9 +18,16 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.messaging_response import MessagingResponse
 
 from db.session import get_db
-from db.repo import get_or_create_user
+from db.repo import (
+    get_or_create_user,
+    get_recent_messages,
+    save_turn,
+    get_pending_event,
+    set_pending_event,
+    clear_pending_event,
+)
 from services.google_oauth import generate_auth_url, get_calendar_service_for_user
-from services.agent import run_agent
+from services.agent import run_agent, classify_confirmation, create_confirmed_event
 from services.rate_limit import check_rate_limit
 from services.sms import send_sms
 #, send_vcard
@@ -105,10 +112,41 @@ async def receive_message(
             resp = _make_response(f"no problem here's a fresh link: {auth_url}", channel, phone)
             return PlainTextResponse(str(resp), media_type="application/xml")
 
-        # Known user, run the agent with their calendar service
+        # Known user, run the agent with their calendar service + recent history
         try:
             calendar_service = get_calendar_service_for_user(user.google_refresh_token)
-            reply = await run_agent(text, calendar_service)
+
+            # If we asked "still want me to add it?", this text may be the answer.
+            # Resolved here, before the model is consulted — the decision to write
+            # to someone's calendar shouldn't hinge on the model's read of history.
+            pending = await get_pending_event(db, phone)
+            decision = classify_confirmation(text) if pending else "unrelated"
+
+            if pending and decision == "confirm":
+                await clear_pending_event(db, phone)
+                reply = await create_confirmed_event(pending, calendar_service)
+                logger.info(f"Confirmed double booking for {phone}: {pending.get('title')}")
+
+            elif pending and decision == "decline":
+                await clear_pending_event(db, phone)
+                reply = "bet, didn't add it"
+
+            else:
+                # Anything that isn't a plain yes/no drops the parked event and
+                # is handled as a fresh request. If it's still the same event,
+                # the clash check simply runs again.
+                if pending:
+                    await clear_pending_event(db, phone)
+
+                history = await get_recent_messages(db, phone)
+                result = await run_agent(text, calendar_service, history=history)
+                reply = result.text
+                if result.pending_event:
+                    await set_pending_event(db, phone, result.pending_event)
+
+            # Only successful exchanges go in the transcript. Persisting a
+            # "sumn went wrong" turn would poison context on the next text.
+            await save_turn(db, phone, text, reply)
         except Exception as e:
             logger.exception(f"Agent error for {phone}: {e}")
             if "invalid_grant" in str(e).lower() or "token" in str(e).lower():
