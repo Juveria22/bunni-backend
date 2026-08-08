@@ -210,28 +210,67 @@ async def create_event(
     return event
 
 
-async def search_future_events(service, query: str, scope: str = "future", max_results: int = 50) -> list[dict]:
+async def get_event(service, event_id: str) -> dict:
+    return service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+
+
+async def delete_event(service, event_id: str) -> None:
+    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    logger.info(f"Deleted event {event_id}")
+
+
+async def list_events(
+    service,
+    time_min: datetime,
+    time_max: datetime,
+    query: Optional[str] = None,
+    max_results: int = 40,
+) -> list[dict]:
+    """
+    Everything on the calendar in a window. Deliberately does no keyword
+    filtering of its own — the model reads the list and decides what matches.
+    Substring matching on a title the user never types exactly is what made
+    "office day saturday" fail to find "Office Day".
+    """
     params = {
         "calendarId": CALENDAR_ID,
-        "q": query,
-        "maxResults": max_results,
+        "timeMin": time_min.isoformat(),
+        "timeMax": time_max.isoformat(),
         "singleEvents": True,
         "orderBy": "startTime",
+        "maxResults": max_results,
     }
-    if scope == "future":
-        params["timeMin"] = datetime.now(timezone.utc).isoformat()
+    if query:
+        params["q"] = query
 
     result = service.events().list(**params).execute()
-    events = result.get("items", [])
-
-    q = query.lower()
-    return [
-        e for e in events
-        if q in e.get("summary", "").lower() or q in e.get("description", "").lower()
-    ]
+    return [e for e in result.get("items", []) if e.get("status") != "cancelled"]
 
 
-async def update_event_reminders(service, events: list[dict], reminder_minutes_list: list[int]) -> int:
+def summarize_event(event: dict) -> dict:
+    """
+    An event flattened for the model to reason over. The weekday is spelled out
+    because users say "saturday's office event", not a date.
+    """
+    date_str, start_time, duration, all_day = read_event_window(event)
+    day = datetime.fromisoformat(date_str).strftime("%A %b %d").lower()
+
+    summary = {
+        "id": event["id"],
+        "title": event.get("summary") or "untitled",
+        "day": day,
+        "date": date_str,
+        "all_day": all_day,
+    }
+    if not all_day:
+        summary["start"] = start_time
+        summary["duration_minutes"] = duration
+    if event.get("location"):
+        summary["location"] = event["location"]
+    return summary
+
+
+async def update_event_reminders(service, event_ids: list[str], reminder_minutes_list: list[int]) -> int:
     overrides = [
         {"method": m, "minutes": mins}
         for mins in reminder_minutes_list
@@ -240,16 +279,16 @@ async def update_event_reminders(service, events: list[dict], reminder_minutes_l
     body = {"reminders": {"useDefault": False, "overrides": overrides}}
     updated = 0
 
-    for event in events:
+    for event_id in event_ids:
         try:
             service.events().patch(
                 calendarId=CALENDAR_ID,
-                eventId=event["id"],
+                eventId=event_id,
                 body=body,
             ).execute()
-            logger.info(f"Updated: {event.get('summary')} ({event['id']})")
+            logger.info(f"Updated reminders on {event_id}")
             updated += 1
         except HttpError as e:
-            logger.error(f"Failed to patch {event['id']}: {e}")
+            logger.error(f"Failed to patch {event_id}: {e}")
 
     return updated

@@ -38,7 +38,7 @@ class Message(Base):
     """
     One row per conversation turn, user or assistant.
     Read back on the next text so the agent can resolve follow-ups
-    like "make it 3pm instead" or answers to ask_clarification.
+    like "make it 3pm instead" or answers to a question it just asked.
     """
 
     __tablename__ = "messages"

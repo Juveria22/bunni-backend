@@ -1,20 +1,23 @@
 """
-Claude agent. Takes a user message + their calendar service,
-routes to the right tool, executes it, returns a reply in gen-z tone.
+Claude agent. Runs a tool loop over the user's calendar: the model can read
+what's actually there, then act on real event ids. Replies in gen-z tone.
 """
 
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
-from functools import lru_cache
+from datetime import datetime, timedelta
+from time import monotonic
 import asyncio
 
 import anthropic
 
 from services.calendar import (
     create_event,
-    search_future_events,
+    delete_event,
+    get_event,
+    list_events,
+    summarize_event,
     update_event_reminders,
     update_event_time,
     find_conflicting_events,
@@ -22,21 +25,44 @@ from services.calendar import (
     all_day_window,
     read_event_window,
     now_local,
+    TIMEZONE,
 )
+
+logger = logging.getLogger(__name__)
+client = anthropic.AsyncAnthropic()
 
 # Google's own default reminder for all-day events: 9am the day before.
 # The normal 60-minute default would fire at 11pm the previous night.
 ALL_DAY_REMINDER_MINUTES = 900
 
-logger = logging.getLogger(__name__)
-client = anthropic.AsyncAnthropic()
+# Twilio gives a webhook ~15s before it gives up, and every model call plus
+# google call spends some of it. Cap the whole loop well inside that.
+AGENT_DEADLINE_SECONDS = 11.0
+MAX_MODEL_CALLS = 3
 
 TOOLS = [
     {
+        "name": "find_events",
+        "description": (
+            "Read what is actually on the calendar. Call this FIRST whenever the user "
+            "refers to an event that already exists — moving it, deleting it, cancelling it, "
+            "changing its reminders — or when you need to know what a day looks like. "
+            "Returns events with their ids, which the other tools need."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "YYYY-MM-DD, start of the window to look at. Defaults to today."},
+                "date_to":   {"type": "string", "description": "YYYY-MM-DD, end of the window. Defaults to 60 days out."},
+                "query":     {"type": "string", "description": "Optional keyword. Leave it out unless you are confident of the exact wording, a date range alone is usually better."},
+            },
+        },
+    },
+    {
         "name": "create_calendar_event",
         "description": (
-            "Use when the user wants to schedule a NEW event, meeting, appointment, "
-            "or any one-time calendar entry."
+            "Add a NEW event. Only for something that does not exist yet — never use this "
+            "to change an event the user already has."
         ),
         "input_schema": {
             "type": "object",
@@ -52,18 +78,11 @@ TOOLS = [
                     "type": "boolean",
                     "default": False,
                     "description": (
-                        "True for an event with no specific time that should sit at the top "
-                        "of the day in google calendar. Leave start_time out when this is true. "
-                        "Never use 00:00 to mean all day."
+                        "True for an event with no specific time that sits at the top of the day. "
+                        "Leave start_time out when true. Never use 00:00 to mean all day."
                     ),
                 },
-                "end_date": {
-                    "type": "string",
-                    "description": (
-                        "YYYY-MM-DD, the LAST day of a multi day all day event such as a trip "
-                        "or vacation. Only meaningful when all_day is true."
-                    ),
-                },
+                "end_date": {"type": "string", "description": "YYYY-MM-DD, LAST day of a multi day all day event. Only with all_day."},
             },
             "required": ["title", "date"],
         },
@@ -71,49 +90,46 @@ TOOLS = [
     {
         "name": "reschedule_event",
         "description": (
-            "Use when the user wants to MOVE or CHANGE THE TIME or DATE of an event that "
-            "ALREADY EXISTS. e.g. 'move my dentist appt to 3pm', 'change the meeting to friday', "
-            "'make my trip all day instead'. Never use create_calendar_event for this, that "
-            "would leave them with two copies of the event."
+            "Move an existing event to a different time or date. Needs an event_id from "
+            "find_events. Anything you leave out stays as it is."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "search_query":    {"type": "string", "description": "Words identifying the existing event, e.g. 'dentist'"},
+                "event_id":        {"type": "string", "description": "id from find_events"},
                 "new_date":        {"type": "string", "description": "YYYY-MM-DD. Omit to keep the current date."},
                 "new_start_time":  {"type": "string", "description": "HH:MM 24hr. Omit to keep the current time."},
                 "duration_minutes":{"type": "integer", "description": "Omit to keep the current length."},
-                "all_day":         {"type": "boolean", "default": False, "description": "True to convert it to an all day event."},
+                "all_day":         {"type": "boolean", "default": False, "description": "True to turn it into an all day event."},
             },
-            "required": ["search_query"],
+            "required": ["event_id"],
         },
     },
     {
-        "name": "update_reminders_by_query",
+        "name": "delete_event",
         "description": (
-            "Use when the user wants to SET or UPDATE reminders on EXISTING events "
-            "matching a keyword like 'all meetings with Zain' or 'every dentist appt'."
+            "Delete an event off the calendar. Needs an event_id from find_events. "
+            "Use for cancel, delete, remove, get rid of, call off."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "search_query":            {"type": "string"},
-                "reminder_offsets_days":   {"type": "array", "items": {"type": "integer"}},
-                "reminder_offsets_hours":  {"type": "array", "items": {"type": "integer"}},
-                "scope":                   {"type": "string", "enum": ["future", "all"], "default": "future"},
+                "event_id": {"type": "string", "description": "id from find_events"},
             },
-            "required": ["search_query", "reminder_offsets_days"],
+            "required": ["event_id"],
         },
     },
     {
-        "name": "ask_clarification",
-        "description": "Use ONLY when intent is genuinely unclear or a required field is missing.",
+        "name": "update_reminders",
+        "description": "Set or change reminders on existing events. Needs event_ids from find_events.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "question": {"type": "string"},
+                "event_ids":              {"type": "array", "items": {"type": "string"}},
+                "reminder_offsets_days":  {"type": "array", "items": {"type": "integer"}},
+                "reminder_offsets_hours": {"type": "array", "items": {"type": "integer"}},
             },
-            "required": ["question"],
+            "required": ["event_ids"],
         },
     },
 ]
@@ -123,43 +139,41 @@ TOOLS = [
 # The static portion of the system prompt never changes.
 # We use Anthropic's prompt caching (cache_control) so the API
 # only processes it once per cache TTL (~5 min), then reads from
-# a cache on subsequent calls. Saves ~400 tokens of compute per request.
+# a cache on subsequent calls.
 # The date is injected separately as a tiny uncached block so the
 # static block stays byte-for-byte identical across all users/requests.
 
 _STATIC_PROMPT = """you are a personal ai calendar assistant. the user texts you and you manage their google calendar.
 
-you have four tools. use exactly one, unless the user is calling off something you just asked them about, then reply in plain text with no tool:
-1. create_calendar_event - for a NEW event
-2. reschedule_event - to move an event that ALREADY exists to a different time or date
-3. update_reminders_by_query - for adding/changing reminders on existing events
-4. ask_clarification - only if you genuinely cannot proceed without more info
+the point of you: managing a calendar from your phone is annoying. the user should be able to text you something short and sloppy and have it just be handled. you do the careful part, they do the bare minimum. do not make them repeat themselves, spell things exactly, or answer questions you could have worked out yourself
 
-new vs existing (important):
-- words like move, change, reschedule, push, make it, shift, instead all mean an EXISTING event. use reschedule_event
-- creating a second copy of something they already have is always wrong. if they are talking about an event they already told you about, move it, do not add it
-- only use create_calendar_event when the event does not exist yet
+how to work:
+- you can read the calendar with find_events. use it, do not guess
+- if the user mentions an event that already exists, call find_events first, then act on the id it gives you
+- never invent an event id. ids only come from find_events
+- prefer a date range over a keyword. people do not type their event titles exactly, "saturdays office thing" might be an event called "Office Day"
+- match on your own judgment: the title, the day, the time, whatever the user gave you. if they say "the first one" or "the 11-6 one" or "the one on saturday", they are answering a question you just asked, look at the list and pick it
+- typos and half sentences are normal. "office day*" is them correcting the name of the thing they just mentioned, not a new request
+- if the search window turns up nothing, widen it once before telling them you found nothing
+- if one event is clearly the best match, just act on it. only ask when two or more are genuinely just as likely, and then list them with their day and time so one word answers it
+- fill in the obvious: a lunch is an hour, a flight is not 15 minutes, "tonight" is this evening. do not interrogate them over details you can reasonably assume
+- once you have done the action you are finished, do not call another tool
+
+rules:
+- if a nj city is mentioned without a state, append ", nj" to the location
+- "week before and day before" -> reminder_offsets_days: [7, 1]
+- be confident, if intent is clear act on it
 
 all day events:
 - if they say all day, or the thing has no natural time (birthday, holiday, vacation, trip, deadline, day off), set all_day true and leave start_time out entirely
 - never use 00:00 or midnight to mean all day, that creates a real event at 12am which is wrong
 - for a range like "vacation monday to friday" set all_day true, date is the first day, end_date is the last day
 
-rules:
-- if a nj city is mentioned without a state, append ", nj" to the location
-- "week before and day before" → reminder_offsets_days: [7, 1]
-- be confident, if intent is clear act on it
-
-double booking:
-- clashes are handled outside of you. the calendar is checked automatically before anything is created or moved
-- a reply in the history like "u already have x then, still want me to add y" was that automatic warning, and nothing was created that turn
-- you never need to check for or ask about clashes yourself, just make the call
-
-conversation context:
-- you can see the recent messages in this thread, use them
-- if you asked for missing info last turn, the new message is the answer. combine it with what they already told you and act, do not ask again
-- follow ups like "make it 3pm instead" or "same time next week" refer to the event from the previous turns
-- if the new message is clearly a fresh request, ignore the older turns
+confirmations (clashes and deletes):
+- these are handled outside of you, automatically, before anything is written
+- a reply in the history like "u already have x then, still want me to add y" or "delete x, for real" was that automatic check, and nothing was written that turn
+- you never need to check for clashes or ask before deleting yourself, just make the call and the confirmation happens on its own
+- this is the one place extra friction is worth it, everything else should be effortless
 
 tone rules (non-negotiable):
 - all lowercase always
@@ -173,18 +187,43 @@ tone rules (non-negotiable):
 - one or two lines max. this is sms not email
 - examples of good replies:
   "added meeting with jake tomorrow at noon, reminder 1hr before"
-  "got it, updated 3 zain events with 7 day and 1 day reminders"
+  "moved saniyahs party to tomorrow at 12pm"
+  "deleted office day"
   "what time tho"
   "u already have standup 3:00pm to 3:30pm then, still want dentist added"
-  "couldn't find any events with that name\""""
+  "couldn't find anything like that on ur calendar\""""
+
+
+def build_system_prompt() -> list[dict]:
+    """
+    Returns a system prompt as a list of content blocks.
+    The large static block is marked for caching. Anthropic's API
+    will cache it for ~5 minutes, so repeat callers skip reprocessing it.
+    The tiny date block is uncached since it changes daily.
+    """
+    # Must be local, not utc — after 8pm eastern utc is already tomorrow, which
+    # made the model resolve "tomorrow" to the day after
+    now = now_local()
+    return [
+        {
+            "type": "text",
+            "text": _STATIC_PROMPT,
+            "cache_control": {"type": "ephemeral"},  # cache this block
+        },
+        {
+            "type": "text",
+            "text": f"today: {now.strftime('%A, %B %d, %Y')} (eastern time)",
+            # no cache_control, tiny and date-specific, not worth caching
+        },
+    ]
 
 
 @dataclass
 class AgentReply:
     """
-    What the agent produced. `pending_action` is set only when a create or a
-    reschedule was blocked by a clash — it carries everything needed to replay
-    the action if the user says yes, so the confirmation never depends on the
+    What the agent produced. `pending_action` is set only when a write was
+    blocked pending a yes/no — a clash, or a delete. It carries everything
+    needed to replay the action, so the confirmation never depends on the
     model's judgment.
     """
     text: str
@@ -193,23 +232,26 @@ class AgentReply:
 
 # Whole-message matches only. "yes but make it 4pm" is deliberately NOT a
 # confirmation — it falls through to the agent as a fresh request, which
-# re-checks the new slot. Better to re-ask than to book the wrong thing.
+# re-checks. Better to re-ask than to write the wrong thing.
 _CONFIRM_REPLIES = {
     "y", "ye", "yes", "yea", "yeah", "yep", "yup", "sure", "ok", "okay", "k",
     "fine", "confirm", "confirmed", "do it", "add it", "still add it", "add",
     "anyway", "go ahead", "book it", "schedule it", "yes please", "yes pls",
+    # answers to "delete x, for real". "cancel it" is deliberately absent —
+    # it reads as decline when the question was "still want me to add x"
+    "delete it", "remove it", "yes delete", "delete",
 }
 
 _DECLINE_REPLIES = {
     "n", "no", "nah", "nope", "nevermind", "never mind", "nvm", "cancel",
     "skip", "skip it", "dont", "don't", "do not", "forget it", "leave it",
-    "no thanks", "no thx",
+    "no thanks", "no thx", "keep it",
 }
 
 
 def classify_confirmation(text: str) -> str:
     """
-    Read a reply to a clash warning as "confirm", "decline", or "unrelated".
+    Read a reply to a warning as "confirm", "decline", or "unrelated".
     Plain string matching, no model call — this decides whether we write to
     someone's calendar, so it should be predictable and cheap.
     """
@@ -223,42 +265,20 @@ def classify_confirmation(text: str) -> str:
 
 async def perform_confirmed_action(record: dict, service) -> str:
     """
-    Carry out an action the user confirmed after a clash warning. The check is
-    skipped here because we already told them exactly what it clashes with.
+    Carry out an action the user confirmed. Checks are skipped here because we
+    already told them exactly what they were agreeing to.
     """
+    action = record.get("action")
     args = record.get("args", record)  # bare args = an older create-only record
 
-    if record.get("action") == "reschedule":
-        return (await _apply_reschedule(
-            args, record["event"], service, skip_conflict_check=True
-        )).text
+    if action == "reschedule":
+        return (await _apply_reschedule(args, record["event"], service, skip_checks=True)).text
+    if action == "delete":
+        return (await _apply_delete(record["event"], service, skip_checks=True)).text
+    return (await _handle_create(args, service, skip_checks=True)).text
 
-    return (await _handle_create(args, service, skip_conflict_check=True)).text
 
-
-def build_system_prompt() -> list[dict]:
-    """
-    Returns a system prompt as a list of content blocks.
-    The large static block is marked for caching. Anthropic's API
-    will cache it for ~5 minutes, so repeat callers skip reprocessing it.
-    The tiny date block is uncached since it changes daily.
-    """
-    # Must be local, not utc — after 8pm eastern utc is already tomorrow, which
-    # made the model resolve "tomorrow" to the day after
-    today = now_local().strftime('%A, %B %d, %Y')
-    return [
-        {
-            "type": "text",
-            "text": _STATIC_PROMPT,
-            "cache_control": {"type": "ephemeral"},  # cache this block
-        },
-        {
-            "type": "text",
-            "text": f"today: {today} (eastern time)",
-            # no cache_control, tiny and date-specific, not worth caching
-        },
-    ]
-
+# ---------- the loop ----------
 
 async def run_agent(
     user_message: str,
@@ -266,49 +286,117 @@ async def run_agent(
     history: list[dict] | None = None,
 ) -> AgentReply:
     """
-    history is prior turns for this user, oldest first, already in
-    Anthropic message shape. Stored turns are plain text only — tool calls
-    are collapsed into the reply we texted back, so there are no dangling
-    tool_use blocks to pair with tool_results.
+    history is prior turns for this user, oldest first, already in Anthropic
+    message shape. Stored turns are plain text only — the tool blocks below
+    live for one request, so nothing dangling gets persisted.
+
+    find_events loops back into the model. Anything that writes ends the turn.
     """
     messages = [*(history or []), {"role": "user", "content": user_message}]
+    deadline = monotonic() + AGENT_DEADLINE_SECONDS
 
-    response = await asyncio.wait_for(client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1024,
-        system=build_system_prompt(),
-        tools=TOOLS,
-        messages=messages,
-        extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-    ), timeout=10.0)
+    for _ in range(MAX_MODEL_CALLS):
+        remaining = deadline - monotonic()
+        if remaining <= 1.5:
+            logger.warning("Agent ran out of time")
+            return AgentReply("that one took too long, try again")
 
-    # log cache hit/miss so you can verify it's working
-    usage = response.usage
-    cache_read = getattr(usage, "cache_read_input_tokens", 0)
-    cache_created = getattr(usage, "cache_creation_input_tokens", 0)
-    logger.info(f"tokens | in:{usage.input_tokens} out:{usage.output_tokens} cache_read:{cache_read} cache_created:{cache_created}")
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=1024,
+                system=build_system_prompt(),
+                tools=TOOLS,
+                messages=messages,
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            ),
+            timeout=remaining,
+        )
 
-    if response.stop_reason != "tool_use":
-        text = next((b.text for b in response.content if b.type == "text"), None)
-        return AgentReply(text or "idk what you mean, try again")
+        usage = response.usage
+        logger.info(
+            f"tokens | in:{usage.input_tokens} out:{usage.output_tokens} "
+            f"cache_read:{getattr(usage, 'cache_read_input_tokens', 0)} "
+            f"cache_created:{getattr(usage, 'cache_creation_input_tokens', 0)}"
+        )
 
-    tool = next((b for b in response.content if b.type == "tool_use"), None)
-    if not tool:
-        return AgentReply("something broke try again")
+        if response.stop_reason != "tool_use":
+            text = next((b.text for b in response.content if b.type == "text"), None)
+            return AgentReply(text or "idk what you mean, try again")
 
-    logger.info(f"Tool: {tool.name} | Input: {json.dumps(tool.input, indent=2)}")
+        messages.append({"role": "assistant", "content": response.content})
+        results = []
 
-    if tool.name == "create_calendar_event":
-        return await _handle_create(tool.input, calendar_service)
-    elif tool.name == "reschedule_event":
-        return await _handle_reschedule(tool.input, calendar_service)
-    elif tool.name == "update_reminders_by_query":
-        return AgentReply(await _handle_update_reminders(tool.input, calendar_service))
-    elif tool.name == "ask_clarification":
-        return AgentReply(tool.input["question"].lower())
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
 
+            logger.info(f"Tool: {block.name} | {json.dumps(block.input)}")
+
+            if block.name == "find_events":
+                found = await _handle_find(block.input, calendar_service)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(found),
+                })
+                continue
+
+            # Everything else writes, and writing ends the turn
+            return await _run_write_tool(block, calendar_service)
+
+        messages.append({"role": "user", "content": results})
+
+    return AgentReply("got a bit lost there, try saying it another way")
+
+
+async def _run_write_tool(block, service) -> AgentReply:
+    if block.name == "create_calendar_event":
+        return await _handle_create(block.input, service)
+    if block.name == "reschedule_event":
+        return await _handle_reschedule(block.input, service)
+    if block.name == "delete_event":
+        return await _handle_delete(block.input, service)
+    if block.name == "update_reminders":
+        return AgentReply(await _handle_update_reminders(block.input, service))
     return AgentReply("something went wrong try again")
 
+
+# ---------- reading ----------
+
+async def _handle_find(args: dict, service) -> list[dict]:
+    """
+    Hand the model the actual calendar contents. No keyword filtering here —
+    the model decides what matches, which is the whole point of it being here.
+    """
+    today = now_local().date()
+
+    start = (
+        datetime.fromisoformat(args["date_from"]).date()
+        if args.get("date_from") else today
+    )
+    end = (
+        datetime.fromisoformat(args["date_to"]).date()
+        if args.get("date_to") else today + timedelta(days=60)
+    )
+    # A window that starts after it ends returns nothing and looks like
+    # "no events" to the model
+    if end < start:
+        start, end = end, start
+
+    events = await list_events(
+        service,
+        time_min=datetime.combine(start, datetime.min.time(), tzinfo=TIMEZONE),
+        time_max=datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=TIMEZONE),
+        query=args.get("query"),
+    )
+
+    summaries = [summarize_event(e) for e in events]
+    logger.info(f"find_events {start}..{end} -> {len(summaries)} events")
+    return summaries
+
+
+# ---------- writing ----------
 
 def _is_all_day(args: dict) -> bool:
     """
@@ -319,7 +407,7 @@ def _is_all_day(args: dict) -> bool:
     return bool(args.get("all_day")) or not args.get("start_time")
 
 
-async def _handle_create(args: dict, service, skip_conflict_check: bool = False) -> AgentReply:
+async def _handle_create(args: dict, service, skip_checks: bool = False) -> AgentReply:
     all_day = _is_all_day(args)
     duration = args.get("duration_minutes", 60)
     default_reminder = ALL_DAY_REMINDER_MINUTES if all_day else 60
@@ -327,8 +415,8 @@ async def _handle_create(args: dict, service, skip_conflict_check: bool = False)
 
     # Check what's already there before writing. On a clash nothing is created —
     # we hand back a question plus the args, and the caller parks them until the
-    # user answers. skip_conflict_check is internal only, never model-controlled.
-    if not skip_conflict_check:
+    # user answers. skip_checks is internal only, never model-controlled.
+    if not skip_checks:
         if all_day:
             start_dt, end_dt = all_day_window(args["date"], args.get("end_date"))
         else:
@@ -371,29 +459,17 @@ async def _handle_create(args: dict, service, skip_conflict_check: bool = False)
 
 
 async def _handle_reschedule(args: dict, service) -> AgentReply:
-    """
-    Move an event that already exists. Looks it up first so we never create a
-    second copy of something the user already has.
-    """
-    query = args["search_query"]
-    matches = await search_future_events(service, query, scope="future")
-
-    if not matches:
-        return AgentReply(f"couldn't find any upcoming events matching {query}")
-
-    if len(matches) > 1:
-        options = ", ".join(_fmt_event_span(e, with_date=True) for e in matches[:3])
-        extra = f" and {len(matches) - 3} more" if len(matches) > 3 else ""
-        return AgentReply(f"found a few matching {query}: {options}{extra}, which one")
-
-    return await _apply_reschedule(args, matches[0], service)
+    event = await _load_event(args.get("event_id"), service)
+    if event is None:
+        return AgentReply("couldn't find that one on ur calendar anymore")
+    return await _apply_reschedule(args, event, service)
 
 
 async def _apply_reschedule(
     args: dict,
     event: dict,
     service,
-    skip_conflict_check: bool = False,
+    skip_checks: bool = False,
 ) -> AgentReply:
     """Apply the move, keeping whatever the user didn't ask to change."""
     cur_date, cur_time, cur_duration, was_all_day = read_event_window(event)
@@ -405,7 +481,7 @@ async def _apply_reschedule(
     all_day = bool(args.get("all_day")) or (was_all_day and not args.get("new_start_time"))
     title = event.get("summary") or "that"
 
-    if not skip_conflict_check:
+    if not skip_checks:
         if all_day:
             start_dt, end_dt = all_day_window(new_date)
         else:
@@ -437,19 +513,60 @@ async def _apply_reschedule(
     return AgentReply(f"moved {title.lower()} to {new_date} at {_fmt_time(new_time)}")
 
 
+async def _handle_delete(args: dict, service) -> AgentReply:
+    event = await _load_event(args.get("event_id"), service)
+    if event is None:
+        return AgentReply("couldn't find that one on ur calendar anymore")
+    return await _apply_delete(event, service)
+
+
+async def _apply_delete(event: dict, service, skip_checks: bool = False) -> AgentReply:
+    """
+    Always asks first. Deleting can't be undone from a text message, and the
+    model picking the wrong event out of find_events is exactly the failure
+    this catches. The event is named back so they can see which one it is.
+    """
+    title = (event.get("summary") or "that").lower()
+
+    if not skip_checks:
+        return AgentReply(
+            f"delete {_fmt_event_span(event, with_date=True)}, for real",
+            pending_action={"action": "delete", "event": event},
+        )
+
+    await delete_event(service, event["id"])
+    return AgentReply(f"deleted {title}")
+
+
 async def _handle_update_reminders(args: dict, service) -> str:
-    query = args["search_query"]
+    event_ids = args.get("event_ids") or []
+    if not event_ids:
+        return "couldn't tell which events u meant"
+
     reminder_minutes = [d * 1440 for d in args.get("reminder_offsets_days", [])]
     reminder_minutes += [h * 60 for h in args.get("reminder_offsets_hours", [])]
+    if not reminder_minutes:
+        return "how far ahead do u want the reminder"
 
-    events = await search_future_events(service, query, scope=args.get("scope", "future"))
-    if not events:
-        return f"no upcoming events found with {query} in them"
+    updated = await update_event_reminders(service, event_ids, reminder_minutes)
+    if not updated:
+        return "couldn't update those, try again"
 
-    updated = await update_event_reminders(service, events, reminder_minutes)
-    labels = _fmt_reminder_list(args)
-    return f"updated {updated} event(s) matching {query}, reminders set {labels}"
+    return f"updated {updated} event(s), reminders set {_fmt_reminder_list(args)}"
 
+
+async def _load_event(event_id: str | None, service) -> dict | None:
+    """Model-supplied ids can be stale — a 404 shouldn't take the whole reply down."""
+    if not event_id:
+        return None
+    try:
+        return await get_event(service, event_id)
+    except Exception as e:
+        logger.warning(f"Could not load event {event_id}: {e}")
+        return None
+
+
+# ---------- formatting ----------
 
 def _fmt_conflict_warning(
     title: str,
@@ -474,9 +591,7 @@ def _fmt_conflict_warning(
     )
     dupe = ", adding this gives u two of them" if same_name and not moving else ""
 
-    return (
-        f"u already have {len(labels)} things then: {', '.join(labels)}{dupe}, {verb}"
-    )
+    return f"u already have {len(labels)} things then: {', '.join(labels)}{dupe}, {verb}"
 
 
 def _fmt_event_span(event: dict, with_date: bool = False) -> str:
@@ -491,7 +606,9 @@ def _fmt_event_span(event: dict, with_date: bool = False) -> str:
             f"to {_fmt_time(f'{end.hour:02d}:{end.minute:02d}')}"
         )
     except (KeyError, ValueError):
-        return summary
+        # All-day events have no dateTime to render
+        day = event.get("start", {}).get("date")
+        return f"{summary} on {day} all day" if with_date and day else summary
 
 
 def _fmt_day_span(date: str, end_date: str | None) -> str:
