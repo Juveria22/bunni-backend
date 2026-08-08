@@ -98,10 +98,13 @@ def exchange_code_for_tokens(code: str) -> tuple[str, str]:
     creds = flow.credentials
 
     # Get user's email
-    import googleapiclient.discovery as gd
-    service = gd.build("oauth2", "v2", credentials=creds)
-    userinfo = service.userinfo().get().execute()
-    email = userinfo.get("email", "unknown")
+    email = "unknown"
+    try:
+        import googleapiclient.discovery as gd
+        service = gd.build("oauth2", "v2", credentials=creds)
+        email = service.userinfo().get().execute().get("email", "unknown")
+    except Exception as e:
+        logger.warning(f"Could not fetch email (non-fatal): {e}")
 
     return creds.refresh_token, email
 
