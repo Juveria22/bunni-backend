@@ -16,10 +16,17 @@ from services.calendar import (
     create_event,
     search_future_events,
     update_event_reminders,
+    update_event_time,
     find_conflicting_events,
     parse_event_window,
+    all_day_window,
+    read_event_window,
     now_local,
 )
+
+# Google's own default reminder for all-day events: 9am the day before.
+# The normal 60-minute default would fire at 11pm the previous night.
+ALL_DAY_REMINDER_MINUTES = 900
 
 logger = logging.getLogger(__name__)
 client = anthropic.AsyncAnthropic()
@@ -36,13 +43,49 @@ TOOLS = [
             "properties": {
                 "title":                  {"type": "string"},
                 "date":                   {"type": "string", "description": "YYYY-MM-DD. Resolve relative dates from today."},
-                "start_time":             {"type": "string", "description": "HH:MM 24hr"},
+                "start_time":             {"type": "string", "description": "HH:MM 24hr. Omit entirely for an all day event."},
                 "duration_minutes":       {"type": "integer", "default": 60},
                 "location":               {"type": "string"},
                 "reminder_minutes_before":{"type": "integer", "default": 60},
                 "description":            {"type": "string"},
+                "all_day": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "True for an event with no specific time that should sit at the top "
+                        "of the day in google calendar. Leave start_time out when this is true. "
+                        "Never use 00:00 to mean all day."
+                    ),
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": (
+                        "YYYY-MM-DD, the LAST day of a multi day all day event such as a trip "
+                        "or vacation. Only meaningful when all_day is true."
+                    ),
+                },
             },
-            "required": ["title", "date", "start_time"],
+            "required": ["title", "date"],
+        },
+    },
+    {
+        "name": "reschedule_event",
+        "description": (
+            "Use when the user wants to MOVE or CHANGE THE TIME or DATE of an event that "
+            "ALREADY EXISTS. e.g. 'move my dentist appt to 3pm', 'change the meeting to friday', "
+            "'make my trip all day instead'. Never use create_calendar_event for this, that "
+            "would leave them with two copies of the event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search_query":    {"type": "string", "description": "Words identifying the existing event, e.g. 'dentist'"},
+                "new_date":        {"type": "string", "description": "YYYY-MM-DD. Omit to keep the current date."},
+                "new_start_time":  {"type": "string", "description": "HH:MM 24hr. Omit to keep the current time."},
+                "duration_minutes":{"type": "integer", "description": "Omit to keep the current length."},
+                "all_day":         {"type": "boolean", "default": False, "description": "True to convert it to an all day event."},
+            },
+            "required": ["search_query"],
         },
     },
     {
@@ -86,10 +129,21 @@ TOOLS = [
 
 _STATIC_PROMPT = """you are a personal ai calendar assistant. the user texts you and you manage their google calendar.
 
-you have three tools. use exactly one, unless the user is calling off something you just asked them about, then reply in plain text with no tool:
-1. create_calendar_event - for any new event
-2. update_reminders_by_query - for adding/changing reminders on existing events
-3. ask_clarification - only if you genuinely cannot proceed without more info
+you have four tools. use exactly one, unless the user is calling off something you just asked them about, then reply in plain text with no tool:
+1. create_calendar_event - for a NEW event
+2. reschedule_event - to move an event that ALREADY exists to a different time or date
+3. update_reminders_by_query - for adding/changing reminders on existing events
+4. ask_clarification - only if you genuinely cannot proceed without more info
+
+new vs existing (important):
+- words like move, change, reschedule, push, make it, shift, instead all mean an EXISTING event. use reschedule_event
+- creating a second copy of something they already have is always wrong. if they are talking about an event they already told you about, move it, do not add it
+- only use create_calendar_event when the event does not exist yet
+
+all day events:
+- if they say all day, or the thing has no natural time (birthday, holiday, vacation, trip, deadline, day off), set all_day true and leave start_time out entirely
+- never use 00:00 or midnight to mean all day, that creates a real event at 12am which is wrong
+- for a range like "vacation monday to friday" set all_day true, date is the first day, end_date is the last day
 
 rules:
 - if a nj city is mentioned without a state, append ", nj" to the location
@@ -97,9 +151,9 @@ rules:
 - be confident, if intent is clear act on it
 
 double booking:
-- clashes are handled outside of you. the calendar is checked automatically before anything is created
+- clashes are handled outside of you. the calendar is checked automatically before anything is created or moved
 - a reply in the history like "u already have x then, still want me to add y" was that automatic warning, and nothing was created that turn
-- you never need to check for or ask about clashes yourself, just create the event
+- you never need to check for or ask about clashes yourself, just make the call
 
 conversation context:
 - you can see the recent messages in this thread, use them
@@ -128,12 +182,13 @@ tone rules (non-negotiable):
 @dataclass
 class AgentReply:
     """
-    What the agent produced. `pending_event` is set only when a create was
-    blocked by a clash — it carries the exact args to replay if the user
-    says yes, so the confirmation never depends on the model's judgment.
+    What the agent produced. `pending_action` is set only when a create or a
+    reschedule was blocked by a clash — it carries everything needed to replay
+    the action if the user says yes, so the confirmation never depends on the
+    model's judgment.
     """
     text: str
-    pending_event: dict | None = None
+    pending_action: dict | None = None
 
 
 # Whole-message matches only. "yes but make it 4pm" is deliberately NOT a
@@ -166,13 +221,19 @@ def classify_confirmation(text: str) -> str:
     return "unrelated"
 
 
-async def create_confirmed_event(args: dict, service) -> str:
+async def perform_confirmed_action(record: dict, service) -> str:
     """
-    Create an event the user confirmed after a clash warning. The check is
-    skipped here because we already told them what it clashes with.
+    Carry out an action the user confirmed after a clash warning. The check is
+    skipped here because we already told them exactly what it clashes with.
     """
-    result = await _handle_create(args, service, skip_conflict_check=True)
-    return result.text
+    args = record.get("args", record)  # bare args = an older create-only record
+
+    if record.get("action") == "reschedule":
+        return (await _apply_reschedule(
+            args, record["event"], service, skip_conflict_check=True
+        )).text
+
+    return (await _handle_create(args, service, skip_conflict_check=True)).text
 
 
 def build_system_prompt() -> list[dict]:
@@ -239,6 +300,8 @@ async def run_agent(
 
     if tool.name == "create_calendar_event":
         return await _handle_create(tool.input, calendar_service)
+    elif tool.name == "reschedule_event":
+        return await _handle_reschedule(tool.input, calendar_service)
     elif tool.name == "update_reminders_by_query":
         return AgentReply(await _handle_update_reminders(tool.input, calendar_service))
     elif tool.name == "ask_clarification":
@@ -247,40 +310,131 @@ async def run_agent(
     return AgentReply("something went wrong try again")
 
 
-async def _handle_create(args: dict, service, skip_conflict_check: bool = False) -> AgentReply:
-    duration = args.get("duration_minutes", 60)
+def _is_all_day(args: dict) -> bool:
+    """
+    A missing start_time means all day. The model is told never to send 00:00
+    for this, but treating no-time as all-day also stops a missing field from
+    silently becoming a midnight event.
+    """
+    return bool(args.get("all_day")) or not args.get("start_time")
 
-    # Check the slot before writing. On a clash nothing is created — we hand
-    # back a question plus the args, and the caller parks them until the user
-    # answers. skip_conflict_check is internal only, never model-controlled.
+
+async def _handle_create(args: dict, service, skip_conflict_check: bool = False) -> AgentReply:
+    all_day = _is_all_day(args)
+    duration = args.get("duration_minutes", 60)
+    default_reminder = ALL_DAY_REMINDER_MINUTES if all_day else 60
+    reminder_minutes = args.get("reminder_minutes_before", default_reminder)
+
+    # Check what's already there before writing. On a clash nothing is created —
+    # we hand back a question plus the args, and the caller parks them until the
+    # user answers. skip_conflict_check is internal only, never model-controlled.
     if not skip_conflict_check:
-        start_dt, end_dt = parse_event_window(args["date"], args["start_time"], duration)
+        if all_day:
+            start_dt, end_dt = all_day_window(args["date"], args.get("end_date"))
+        else:
+            start_dt, end_dt = parse_event_window(args["date"], args["start_time"], duration)
+
         conflicts = await find_conflicting_events(service, start_dt, end_dt)
         if conflicts:
             logger.info(f"Conflict on {args['title']}: {[c.get('summary') for c in conflicts]}")
             return AgentReply(
-                _fmt_conflict_warning(args["title"], conflicts),
-                pending_event=args,
+                _fmt_conflict_warning(args["title"], conflicts, multi_day=all_day),
+                pending_action={"action": "create", "args": args},
             )
 
     await create_event(
         service,
         title=args["title"],
         date=args["date"],
-        start_time=args["start_time"],
+        start_time=args.get("start_time"),
         duration_minutes=duration,
         location=args.get("location"),
-        reminder_minutes=args.get("reminder_minutes_before", 60),
+        reminder_minutes=reminder_minutes,
         description=args.get("description"),
+        all_day=all_day,
+        end_date=args.get("end_date"),
     )
 
-    time_str = _fmt_time(args["start_time"])
     loc = f" at {args['location']}" if args.get("location") else ""
-    reminder = _fmt_reminder(args.get("reminder_minutes_before", 60))
+
+    if all_day:
+        when = _fmt_day_span(args["date"], args.get("end_date"))
+        return AgentReply(
+            f"added {args['title']} {when} all day{loc}, "
+            f"reminder {_fmt_all_day_reminder(reminder_minutes)}"
+        )
 
     return AgentReply(
-        f"added {args['title']} on {args['date']} at {time_str}{loc}, reminder {reminder} before"
+        f"added {args['title']} on {args['date']} at {_fmt_time(args['start_time'])}{loc}, "
+        f"reminder {_fmt_reminder(reminder_minutes)} before"
     )
+
+
+async def _handle_reschedule(args: dict, service) -> AgentReply:
+    """
+    Move an event that already exists. Looks it up first so we never create a
+    second copy of something the user already has.
+    """
+    query = args["search_query"]
+    matches = await search_future_events(service, query, scope="future")
+
+    if not matches:
+        return AgentReply(f"couldn't find any upcoming events matching {query}")
+
+    if len(matches) > 1:
+        options = ", ".join(_fmt_event_span(e, with_date=True) for e in matches[:3])
+        extra = f" and {len(matches) - 3} more" if len(matches) > 3 else ""
+        return AgentReply(f"found a few matching {query}: {options}{extra}, which one")
+
+    return await _apply_reschedule(args, matches[0], service)
+
+
+async def _apply_reschedule(
+    args: dict,
+    event: dict,
+    service,
+    skip_conflict_check: bool = False,
+) -> AgentReply:
+    """Apply the move, keeping whatever the user didn't ask to change."""
+    cur_date, cur_time, cur_duration, was_all_day = read_event_window(event)
+
+    new_date = args.get("new_date") or cur_date
+    new_time = args.get("new_start_time") or (None if args.get("all_day") else cur_time)
+    duration = args.get("duration_minutes") or cur_duration or 60
+    # Stays all day unless they gave it a time; becomes all day if they asked
+    all_day = bool(args.get("all_day")) or (was_all_day and not args.get("new_start_time"))
+    title = event.get("summary") or "that"
+
+    if not skip_conflict_check:
+        if all_day:
+            start_dt, end_dt = all_day_window(new_date)
+        else:
+            start_dt, end_dt = parse_event_window(new_date, new_time, duration)
+
+        # Excluding this event's own id — otherwise moving it an hour later
+        # would report a clash with itself
+        conflicts = await find_conflicting_events(
+            service, start_dt, end_dt, exclude_event_ids={event.get("id")}
+        )
+        if conflicts:
+            logger.info(f"Conflict moving {title}: {[c.get('summary') for c in conflicts]}")
+            return AgentReply(
+                _fmt_conflict_warning(title, conflicts, multi_day=all_day, moving=True),
+                pending_action={"action": "reschedule", "args": args, "event": event},
+            )
+
+    await update_event_time(
+        service,
+        event_id=event["id"],
+        date=new_date,
+        start_time=new_time,
+        duration_minutes=duration,
+        all_day=all_day,
+    )
+
+    if all_day:
+        return AgentReply(f"moved {title.lower()} to {new_date} all day")
+    return AgentReply(f"moved {title.lower()} to {new_date} at {_fmt_time(new_time)}")
 
 
 async def _handle_update_reminders(args: dict, service) -> str:
@@ -297,36 +451,67 @@ async def _handle_update_reminders(args: dict, service) -> str:
     return f"updated {updated} event(s) matching {query}, reminders set {labels}"
 
 
-def _fmt_conflict_warning(title: str, conflicts: list[dict]) -> str:
+def _fmt_conflict_warning(
+    title: str,
+    conflicts: list[dict],
+    multi_day: bool = False,
+    moving: bool = False,
+) -> str:
     """
-    The clash question we text back. Names at most two clashing events —
-    this is sms, a wall of them helps nobody.
+    The clash question we text back. Every clashing event is named — a partial
+    list would let someone confirm a booking over something they never saw.
     """
-    labels = [_fmt_event_span(e) for e in conflicts[:2]]
-    remaining = len(conflicts) - len(labels)
-    if remaining > 0:
-        labels.append(f"{remaining} more")
+    labels = [_fmt_event_span(e, with_date=multi_day) for e in conflicts]
+    verb = "move it there anyway" if moving else f"still want me to add {title.lower()}"
 
-    if len(labels) > 1:
-        clash = f"{', '.join(labels[:-1])} and {labels[-1]}"
-    else:
-        clash = labels[0]
+    if len(labels) == 1:
+        return f"u already have {labels[0]} then, {verb}"
 
-    return f"u already have {clash} then, still want me to add {title.lower()}"
+    # Same title means they probably meant to move it, not have two of it
+    same_name = any(
+        (e.get("summary") or "").strip().lower() == title.strip().lower()
+        for e in conflicts
+    )
+    dupe = ", adding this gives u two of them" if same_name and not moving else ""
+
+    return (
+        f"u already have {len(labels)} things then: {', '.join(labels)}{dupe}, {verb}"
+    )
 
 
-def _fmt_event_span(event: dict) -> str:
+def _fmt_event_span(event: dict, with_date: bool = False) -> str:
     """"standup 3:00pm to 3:30pm" for an existing calendar event."""
     summary = (event.get("summary") or "untitled").lower()
     try:
         start = datetime.fromisoformat(event["start"]["dateTime"])
         end = datetime.fromisoformat(event["end"]["dateTime"])
+        day = f"{start.strftime('%b %d').lower()} " if with_date else ""
         return (
-            f"{summary} {_fmt_time(f'{start.hour:02d}:{start.minute:02d}')} "
+            f"{day}{summary} {_fmt_time(f'{start.hour:02d}:{start.minute:02d}')} "
             f"to {_fmt_time(f'{end.hour:02d}:{end.minute:02d}')}"
         )
     except (KeyError, ValueError):
         return summary
+
+
+def _fmt_day_span(date: str, end_date: str | None) -> str:
+    """"on 2026-08-11" or "2026-08-11 to 2026-08-15" for an all-day event."""
+    if end_date and end_date != date:
+        return f"{date} to {end_date}"
+    return f"on {date}"
+
+
+def _fmt_all_day_reminder(minutes: int) -> str:
+    """
+    All-day reminders are offsets from midnight, so "15hr before" is a useless
+    thing to text someone. Say when it actually fires.
+    """
+    if minutes == ALL_DAY_REMINDER_MINUTES:
+        return "9am the day before"
+    if minutes % 1440 == 0:
+        days = minutes // 1440
+        return "on the day" if days == 0 else f"{days} day{'s' if days > 1 else ''} before"
+    return f"{_fmt_reminder(minutes)} before"
 
 
 def _fmt_time(hhmm: str) -> str:

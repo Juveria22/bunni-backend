@@ -27,7 +27,7 @@ from db.repo import (
     clear_pending_event,
 )
 from services.google_oauth import generate_auth_url, get_calendar_service_for_user
-from services.agent import run_agent, classify_confirmation, create_confirmed_event
+from services.agent import run_agent, classify_confirmation, perform_confirmed_action
 from services.rate_limit import check_rate_limit
 from services.sms import send_sms
 #, send_vcard
@@ -124,15 +124,15 @@ async def receive_message(
 
             if pending and decision == "confirm":
                 await clear_pending_event(db, phone)
-                reply = await create_confirmed_event(pending, calendar_service)
-                logger.info(f"Confirmed double booking for {phone}: {pending.get('title')}")
+                reply = await perform_confirmed_action(pending, calendar_service)
+                logger.info(f"Confirmed {pending.get('action', 'create')} for {phone}")
 
             elif pending and decision == "decline":
                 await clear_pending_event(db, phone)
-                reply = "bet, didn't add it"
+                reply = "bet, left it alone"
 
             else:
-                # Anything that isn't a plain yes/no drops the parked event and
+                # Anything that isn't a plain yes/no drops the parked action and
                 # is handled as a fresh request. If it's still the same event,
                 # the clash check simply runs again.
                 if pending:
@@ -141,8 +141,8 @@ async def receive_message(
                 history = await get_recent_messages(db, phone)
                 result = await run_agent(text, calendar_service, history=history)
                 reply = result.text
-                if result.pending_event:
-                    await set_pending_event(db, phone, result.pending_event)
+                if result.pending_action:
+                    await set_pending_event(db, phone, result.pending_action)
 
             # Only successful exchanges go in the transcript. Persisting a
             # "sumn went wrong" turn would poison context on the next text.

@@ -4,7 +4,7 @@ that's already scoped to a specific user's credentials.
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -45,11 +45,94 @@ def parse_event_window(
     return start_dt, end_dt
 
 
+def all_day_window(date: str, end_date: str | None = None) -> tuple[datetime, datetime]:
+    """
+    The real span an all-day event blocks: local midnight on the first day
+    through local midnight after the last. Used to find what it collides with,
+    since "all day" means the whole day, not a slot at 00:00.
+    """
+    start_day = datetime.fromisoformat(date).date()
+    last_day = datetime.fromisoformat(end_date).date() if end_date else start_day
+    return (
+        datetime.combine(start_day, time.min, tzinfo=TIMEZONE),
+        datetime.combine(last_day + timedelta(days=1), time.min, tzinfo=TIMEZONE),
+    )
+
+
+def build_time_body(
+    date: str,
+    start_time: str | None = None,
+    duration_minutes: int = 60,
+    all_day: bool = False,
+    end_date: str | None = None,
+) -> dict:
+    """
+    The start/end half of an event body, shared by create and reschedule.
+
+    All-day events use plain dates with no time at all — that's what makes
+    Google render them in the top strip instead of at midnight. Google treats
+    `end` as exclusive, so a one-day event ends on the following day.
+    """
+    if all_day:
+        start_day = datetime.fromisoformat(date).date()
+        last_day = datetime.fromisoformat(end_date).date() if end_date else start_day
+        return {
+            "start": {"date": start_day.isoformat()},
+            "end": {"date": (last_day + timedelta(days=1)).isoformat()},
+        }
+
+    start_dt, end_dt = parse_event_window(date, start_time, duration_minutes)
+    return {
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE_NAME},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE_NAME},
+    }
+
+
+def read_event_window(event: dict) -> tuple[str, str | None, int, bool]:
+    """
+    (date, start_time, duration_minutes, all_day) for an existing event, so a
+    reschedule can keep whatever the user didn't ask to change.
+    """
+    start, end = event.get("start", {}), event.get("end", {})
+
+    if "dateTime" in start:
+        s = datetime.fromisoformat(start["dateTime"])
+        e = datetime.fromisoformat(end["dateTime"])
+        minutes = int((e - s).total_seconds() // 60)
+        return s.date().isoformat(), f"{s.hour:02d}:{s.minute:02d}", minutes, False
+
+    return datetime.fromisoformat(start["date"]).date().isoformat(), None, 0, True
+
+
+async def update_event_time(
+    service,
+    event_id: str,
+    date: str,
+    start_time: str | None = None,
+    duration_minutes: int = 60,
+    all_day: bool = False,
+    end_date: str | None = None,
+) -> dict:
+    """
+    Move an existing event. Patch replaces the whole start/end objects, so
+    switching a timed event to all-day drops its dateTime rather than leaving
+    a stale one behind.
+    """
+    event = service.events().patch(
+        calendarId=CALENDAR_ID,
+        eventId=event_id,
+        body=build_time_body(date, start_time, duration_minutes, all_day, end_date),
+    ).execute()
+    logger.info(f"Moved event {event_id} to {date} {start_time or '(all day)'}")
+    return event
+
+
 async def find_conflicting_events(
     service,
     start_dt: datetime,
     end_dt: datetime,
-    max_results: int = 10,
+    max_results: int = 50,
+    exclude_event_ids: set[str] | None = None,
 ) -> list[dict]:
     """
     Existing events that overlap [start_dt, end_dt).
@@ -57,7 +140,11 @@ async def find_conflicting_events(
     Google's timeMin/timeMax filter already means "overlaps this range", so the
     remaining work is dropping things that aren't real clashes: all-day events,
     slots the user marked free, and invites they declined.
+
+    exclude_event_ids keeps a reschedule from finding the event it's moving and
+    reporting it as a clash with itself.
     """
+    excluded = exclude_event_ids or set()
     result = service.events().list(
         calendarId=CALENDAR_ID,
         timeMin=start_dt.isoformat(),
@@ -69,10 +156,13 @@ async def find_conflicting_events(
 
     conflicts = []
     for event in result.get("items", []):
+        if event.get("id") in excluded:
+            continue
         if event.get("status") == "cancelled":
             continue
-        # All-day events carry "date" instead of "dateTime" — they blanket the
-        # whole day and would flag every single event as a conflict
+        # All-day events carry "date" instead of "dateTime". Birthdays and
+        # holidays sit on the calendar all year and don't hold a time slot,
+        # so they'd false-positive on essentially everything
         if "dateTime" not in event.get("start", {}):
             continue
         # transparency=transparent is Google's "show me as free"
@@ -93,18 +183,17 @@ async def create_event(
     service,
     title: str,
     date: str,
-    start_time: str,
+    start_time: Optional[str] = None,
     duration_minutes: int = 60,
     location: Optional[str] = None,
     reminder_minutes: int = 60,
     description: Optional[str] = None,
+    all_day: bool = False,
+    end_date: Optional[str] = None,
 ) -> dict:
-    start_dt, end_dt = parse_event_window(date, start_time, duration_minutes)
-
     body = {
         "summary": title,
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE_NAME},
-        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE_NAME},
+        **build_time_body(date, start_time, duration_minutes, all_day, end_date),
         "reminders": {
             "useDefault": False,
             "overrides": [
