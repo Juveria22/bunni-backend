@@ -24,6 +24,7 @@ from services.calendar import (
     find_conflicting_events,
     parse_event_window,
     all_day_window,
+    all_day_span_days,
     read_event_window,
     now_local,
     TIMEZONE,
@@ -43,6 +44,12 @@ ALL_DAY_REMINDER_MINUTES = 900
 AGENT_DEADLINE_SECONDS = 30.0
 MAX_MODEL_CALLS = 4
 
+# How far ahead find_events looks when the model doesn't say, and how many
+# occurrences of one repeating event are worth showing. Both are token costs
+# paid on every call, and the model can always ask for a wider window.
+DEFAULT_LOOKAHEAD_DAYS = 30
+MAX_INSTANCES_PER_SERIES = 3
+
 TOOLS = [
     {
         "name": "find_events",
@@ -56,7 +63,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "date_from": {"type": "string", "description": "YYYY-MM-DD, start of the window to look at. Defaults to today."},
-                "date_to":   {"type": "string", "description": "YYYY-MM-DD, end of the window. Defaults to 60 days out."},
+                "date_to":   {"type": "string", "description": "YYYY-MM-DD, end of the window. Defaults to 30 days out. Ask for a wider one if you need it."},
                 "query":     {"type": "string", "description": "Optional keyword. Leave it out unless you are confident of the exact wording, a date range alone is usually better."},
             },
         },
@@ -102,6 +109,7 @@ TOOLS = [
                 "event_id":        {"type": "string", "description": "id from find_events"},
                 "new_date":        {"type": "string", "description": "YYYY-MM-DD. Omit to keep the current date."},
                 "new_start_time":  {"type": "string", "description": "HH:MM 24hr. Omit to keep the current time."},
+                "new_end_date":    {"type": "string", "description": "YYYY-MM-DD, LAST day of a multi day all day event. Omit to keep its current length."},
                 "duration_minutes":{"type": "integer", "description": "Omit to keep the current length."},
                 "all_day":         {"type": "boolean", "default": False, "description": "True to turn it into an all day event."},
             },
@@ -366,7 +374,6 @@ async def run_agent(
                 system=build_system_prompt(),
                 tools=TOOLS,
                 messages=messages,
-                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
             ),
             timeout=remaining,
         )
@@ -403,6 +410,10 @@ async def run_agent(
             # Everything else writes, and writing ends the turn
             return await _run_write_tool(block, calendar_service)
 
+        if not results:
+            logger.warning("Model signalled tool_use but sent no tool blocks")
+            return AgentReply("something broke try again")
+
         messages.append({"role": "user", "content": results})
 
     return AgentReply("got a bit lost there, try saying it another way")
@@ -435,7 +446,7 @@ async def _handle_find(args: dict, service) -> list[dict]:
     )
     end = (
         datetime.fromisoformat(args["date_to"]).date()
-        if args.get("date_to") else today + timedelta(days=60)
+        if args.get("date_to") else today + timedelta(days=DEFAULT_LOOKAHEAD_DAYS)
     )
     # A window that starts after it ends returns nothing and looks like
     # "no events" to the model
@@ -449,9 +460,36 @@ async def _handle_find(args: dict, service) -> list[dict]:
         query=args.get("query"),
     )
 
-    summaries = [summarize_event(e) for e in events]
-    logger.info(f"find_events {start}..{end} -> {len(summaries)} events")
+    kept = _thin_recurring(events)
+    summaries = [summarize_event(e) for e in kept]
+    logger.info(
+        f"find_events {start}..{end} -> {len(summaries)} events "
+        f"({len(events) - len(kept)} repeat instances dropped)"
+    )
     return summaries
+
+
+def _thin_recurring(events: list[dict]) -> list[dict]:
+    """
+    Keep only the first few instances of any repeating event.
+
+    singleEvents=True expands a series into one row per occurrence, so a daily
+    standup is 30 near-identical rows over a month. They push everything else
+    past the result cap, drown out what the user actually asked about, and get
+    paid for as input tokens on every call.
+    """
+    seen: dict[str, int] = {}
+    kept = []
+
+    for event in events:
+        series = event.get("recurringEventId")
+        if series:
+            seen[series] = seen.get(series, 0) + 1
+            if seen[series] > MAX_INSTANCES_PER_SERIES:
+                continue
+        kept.append(event)
+
+    return kept
 
 
 # ---------- writing ----------
@@ -539,9 +577,19 @@ async def _apply_reschedule(
     all_day = bool(args.get("all_day")) or (was_all_day and not args.get("new_start_time"))
     title = event.get("summary") or "that"
 
+    # A multi-day all-day event keeps its length unless they say otherwise.
+    # Rebuilding it from the start date alone turns a week off into one day.
+    new_end_date = args.get("new_end_date")
+    if all_day and not new_end_date:
+        span = all_day_span_days(event) if was_all_day else 1
+        if span > 1:
+            new_end_date = (
+                datetime.fromisoformat(new_date).date() + timedelta(days=span - 1)
+            ).isoformat()
+
     if not skip_checks:
         if all_day:
-            start_dt, end_dt = all_day_window(new_date)
+            start_dt, end_dt = all_day_window(new_date, new_end_date)
         else:
             start_dt, end_dt = parse_event_window(new_date, new_time, duration)
 
@@ -564,10 +612,13 @@ async def _apply_reschedule(
         start_time=new_time,
         duration_minutes=duration,
         all_day=all_day,
+        end_date=new_end_date,
     )
 
     if all_day:
-        return AgentReply(f"moved {title.lower()} to {new_date} all day")
+        return AgentReply(
+            f"moved {title.lower()} to {_fmt_day_span(new_date, new_end_date)} all day"
+        )
     return AgentReply(f"moved {title.lower()} to {new_date} at {_fmt_time(new_time)}")
 
 

@@ -114,6 +114,22 @@ def read_event_window(event: dict) -> tuple[str, str | None, int, bool]:
     return datetime.fromisoformat(start["date"]).date().isoformat(), None, 0, True
 
 
+def all_day_span_days(event: dict) -> int:
+    """
+    How many days an all-day event covers. Google's `end` is exclusive, so a
+    single day spans 1. Anything that isn't all-day spans 1 too.
+
+    Needed on reschedule: without it, moving a five day trip rebuilds it with
+    end = start + 1 and quietly throws away four days.
+    """
+    start, end = event.get("start", {}), event.get("end", {})
+    if "date" not in start or "date" not in end:
+        return 1
+    first = datetime.fromisoformat(start["date"]).date()
+    last = datetime.fromisoformat(end["date"]).date()
+    return max((last - first).days, 1)
+
+
 async def update_event_time(
     service,
     event_id: str,
@@ -277,6 +293,10 @@ def summarize_event(event: dict) -> dict:
         summary["duration_minutes"] = duration
     if event.get("location"):
         summary["location"] = event["location"]
+    if event.get("recurringEventId"):
+        # Only the next few occurrences are shown, so say it repeats rather
+        # than let the model conclude those are all of them
+        summary["repeats"] = True
     return summary
 
 

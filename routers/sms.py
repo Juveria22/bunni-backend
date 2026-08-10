@@ -13,8 +13,9 @@ The From field tells us which channel: "whatsapp:+1..." vs "+1..."
 
 import os
 import logging
-from fastapi import APIRouter, BackgroundTasks, Form, Request
+from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
 from db.session import get_db
@@ -34,13 +35,37 @@ from services.agent import (
     perform_confirmed_action,
 )
 from services.rate_limit import check_rate_limit
-from services.sms import send_sms, send_message
-#, send_vcard
+from services.sms import send_message
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER")  # "whatsapp:+14155238886"
+
+# The webhook is a public url and the From field is just a form value. Without
+# checking Twilio's signature, anyone who finds the url can post From=<someone
+# else's number> and read, move or delete that person's calendar. Every request
+# must prove it came from Twilio.
+_validator = RequestValidator(os.environ["TWILIO_AUTH_TOKEN"])
+VALIDATE_SIGNATURE = os.environ.get("TWILIO_VALIDATE_SIGNATURE", "true").lower() != "false"
+
+
+async def _is_from_twilio(request: Request, form: dict) -> bool:
+    """
+    Twilio signs the exact public url it posted to. Railway terminates tls and
+    forwards http, so rebuild the url from the forwarded headers — signing
+    against the internal scheme would reject every genuine request.
+    """
+    if not VALIDATE_SIGNATURE:
+        return True
+
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    url = f"{proto}://{host}{request.url.path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+
+    return _validator.validate(url, form, request.headers.get("X-Twilio-Signature", ""))
 
 
 def _parse_channel(from_field: str) -> tuple[str, str]:
@@ -53,35 +78,24 @@ def _parse_channel(from_field: str) -> tuple[str, str]:
     return from_field, "sms"
 
 
-def _make_response(body: str, channel: str, to_number: str) -> MessagingResponse:
-    """Build a TwiML response. For WhatsApp, prefix the To number."""
-    resp = MessagingResponse()
-    msg = resp.message(body)
-    if channel == "whatsapp" and WHATSAPP_NUMBER:
-        msg.sender = WHATSAPP_NUMBER
-    return resp
-
-def _make_vcard() -> str:
-    number = TWILIO_PHONE_NUMBER  # add this import from services.sms or os.environ
-    return f"""BEGIN:VCARD
-VERSION:3.0
-FN:gcal
-TEL;TYPE=CELL:{number}
-END:VCARD"""
-
 ONBOARDING_MSG = "heyy\n\ngcal setup: {auth_url}"
 
-ALREADY_ONBOARDED_MSG = (
-    "u're connected just txt me what you want on ur gcal"
-)
 
 @router.get("/test")
 async def test():
     return {"status": "ok"}
 
-def _twiml(body: str | None, channel: str, phone: str) -> PlainTextResponse:
-    """TwiML for the webhook. body=None returns an empty Response, sending nothing."""
-    resp = _make_response(body, channel, phone) if body else MessagingResponse()
+
+def _twiml(body: str | None, channel: str) -> PlainTextResponse:
+    """
+    TwiML for the webhook. body=None returns an empty Response, which sends
+    nothing — used when the real reply is going out over the rest api instead.
+    """
+    resp = MessagingResponse()
+    if body:
+        msg = resp.message(body)
+        if channel == "whatsapp" and WHATSAPP_NUMBER:
+            msg.sender = WHATSAPP_NUMBER
     return PlainTextResponse(str(resp), media_type="application/xml")
 
 
@@ -102,6 +116,10 @@ async def receive_message(
     in Twilio's ~15s timeout, which capped how much thinking it could do.
     Replies that need no model call still ride back on the response itself.
     """
+    if not await _is_from_twilio(request, dict(await request.form())):
+        logger.warning(f"Rejected unsigned request claiming to be from {From!r}")
+        raise HTTPException(status_code=403, detail="bad signature")
+
     phone, channel = _parse_channel(From.strip())
     text = Body.strip()
 
@@ -109,28 +127,27 @@ async def receive_message(
 
     # Rate limit: 30 messages per user per hour (Redis-backed)
     if not await check_rate_limit(phone):
-        return _twiml("one at a time bestie", channel, phone)
+        return _twiml("one at a time bestie", channel)
 
     async with get_db() as db:
-        user, created = await get_or_create_user(db, phone)
+        user, _created = await get_or_create_user(db, phone)
 
         # New user, send onboarding link
         if not user.is_onboarded:
             auth_url = generate_auth_url(phone)
-            #await send_vcard(phone)
             logger.info(f"Sent onboarding link to {phone} via {channel}")
-            return _twiml(ONBOARDING_MSG.format(auth_url=auth_url), channel, phone)
+            return _twiml(ONBOARDING_MSG.format(auth_url=auth_url), channel)
 
         # Returning user texting connect or reconnect, re-auth
         if text.lower() in ("connect", "reconnect", "reauth", "reset"):
             auth_url = generate_auth_url(phone)
-            return _twiml(f"no problem here's a fresh link: {auth_url}", channel, phone)
+            return _twiml(f"no problem here's a fresh link: {auth_url}", channel)
 
         # Read it out before the session closes, the background task opens its own
         refresh_token = user.google_refresh_token
 
     background_tasks.add_task(_reply_out_of_band, phone, text, channel, refresh_token)
-    return _twiml(None, channel, phone)
+    return _twiml(None, channel)
 
 
 async def _reply_out_of_band(phone: str, text: str, channel: str, refresh_token: str) -> None:
@@ -192,7 +209,10 @@ async def _reply_out_of_band(phone: str, text: str, channel: str, refresh_token:
 
     except Exception as e:
         logger.exception(f"Agent error for {phone}: {e}")
-        if "invalid_grant" in str(e).lower() or "token" in str(e).lower():
+        # Only google's actual revoked/expired signal. Matching on "token"
+        # meant any anthropic error mentioning max_tokens told the user to
+        # reconnect their google account
+        if "invalid_grant" in str(e).lower():
             reply = f"your google connection expired reconnect here: {generate_auth_url(phone)}"
 
     try:
