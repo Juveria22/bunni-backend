@@ -687,11 +687,16 @@ def _fmt_conflict_warning(
     The clash question we text back. Every clashing event is named — a partial
     list would let someone confirm a booking over something they never saw.
     """
-    labels = [_fmt_event_span(e, with_date=multi_day) for e in conflicts]
     verb = "move it there anyway?" if moving else f"still want me to add {title.lower()}?"
 
-    if len(labels) == 1:
-        return f"u already have {labels[0]} then, {verb}"
+    if len(conflicts) == 1:
+        # Room to spell it out properly when there's only one
+        return f"u already have {_fmt_event_span(conflicts[0], with_date=multi_day)} then, {verb}"
+
+    # Start times only past that. Every clash still gets named, but the end
+    # times are what tip a long list over an sms segment, and a start time is
+    # enough to recognise your own calendar
+    labels = [_fmt_event_span(e, with_date=multi_day, compact=True) for e in conflicts]
 
     # Same title means they probably meant to move it, not have two of it
     same_name = any(
@@ -703,21 +708,31 @@ def _fmt_conflict_warning(
     return f"u already have {len(labels)} things then: {', '.join(labels)}{dupe}, {verb}"
 
 
-def _fmt_event_span(event: dict, with_date: bool = False) -> str:
-    """"standup 3:00pm to 3:30pm" for an existing calendar event."""
+def _fmt_event_span(event: dict, with_date: bool = False, compact: bool = False) -> str:
+    """
+    "standup 3:00pm to 3:30pm" for an existing calendar event, or just
+    "standup 3:00pm" when compact. All-day events say so instead of a time.
+    """
     summary = (event.get("summary") or "untitled").lower()
+    start_raw = event.get("start", {})
+
+    if "dateTime" not in start_raw:
+        day = start_raw.get("date")
+        return f"{summary} on {day} all day" if with_date and day else f"{summary} all day"
+
     try:
-        start = datetime.fromisoformat(event["start"]["dateTime"])
-        end = datetime.fromisoformat(event["end"]["dateTime"])
+        start = datetime.fromisoformat(start_raw["dateTime"])
         day = f"{start.strftime('%b %d').lower()} " if with_date else ""
-        return (
-            f"{day}{summary} {_fmt_time(f'{start.hour:02d}:{start.minute:02d}')} "
-            f"to {_fmt_time(f'{end.hour:02d}:{end.minute:02d}')}"
-        )
+        opens = _fmt_time(f"{start.hour:02d}:{start.minute:02d}")
+
+        if compact:
+            return f"{day}{summary} {opens}"
+
+        end = datetime.fromisoformat(event["end"]["dateTime"])
+        closes = _fmt_time(f"{end.hour:02d}:{end.minute:02d}")
+        return f"{day}{summary} {opens} to {closes}"
     except (KeyError, ValueError):
-        # All-day events have no dateTime to render
-        day = event.get("start", {}).get("date")
-        return f"{summary} on {day} all day" if with_date and day else summary
+        return summary
 
 
 def _fmt_day_span(date: str, end_date: str | None) -> str:

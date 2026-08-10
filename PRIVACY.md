@@ -23,7 +23,7 @@ gcal agent ("we", "us", "our") operates an AI-powered SMS calendar assistant. Th
 
 Your phone number and Google OAuth refresh token are stored securely in an encrypted database.
 
-We also store the messages you exchange with us — your texts and our replies — in that same database. This is what lets the assistant understand follow-ups like "make it 3pm instead" or answer a question it asked you. Only the most recent messages are ever sent back to the AI model; older ones stay at rest until deleted.
+We also store the messages you exchange with us — your texts and our replies — in that same database. This is what lets the assistant understand follow-ups like "make it 3pm instead" or answer a question it asked you. Only messages from the last hour are ever sent back to the AI model, and stored messages are automatically deleted after 7 days.
 
 We do not store your calendar event content itself. Note that a message you send may describe an event, and that message text is stored as described above.
 
@@ -50,7 +50,9 @@ Reply **STOP** to unsubscribe at any time. Reply **HELP** for help.
 
 ## Data Retention
 
-We retain your data, including your message history, for as long as you have an active account. To delete your data, reply STOP or contact us at the email below. Deleting your account deletes your stored messages along with it.
+Your account details (phone number, Google email, and access tokens) are retained for as long as you have an active account. Your message history is deleted automatically after 7 days.
+
+To delete your data, reply STOP or contact us at the email below. Deleting your account deletes any remaining stored messages along with it.
 
 ## Security
 

@@ -22,6 +22,11 @@ MAX_STORED_CHARS = 2000
 # the user has long forgotten about.
 PENDING_CONFIRMATION_MINUTES = 30
 
+# Only the last hour of conversation is ever read back. Keeping a week leaves
+# room to debug a complaint, and holding people's message text indefinitely
+# when nothing reads it is storage and privacy exposure for nothing.
+MESSAGE_RETENTION_DAYS = 7
+
 
 async def get_user(db: AsyncSession, phone: str) -> User | None:
     result = await db.execute(select(User).where(User.phone_number == phone))
@@ -140,3 +145,29 @@ async def clear_pending_event(db: AsyncSession, phone: str) -> None:
         delete(PendingConfirmation).where(PendingConfirmation.phone_number == phone)
     )
     await db.flush()
+
+
+async def prune_old_data(db: AsyncSession) -> tuple[int, int]:
+    """
+    Drop transcript rows past the retention window, and any parked confirmation
+    that expired without being answered — those are only cleared when the user
+    texts again, so someone who never replies leaves one behind forever.
+
+    Returns (messages removed, pending removed).
+    """
+    now = datetime.now(timezone.utc)
+
+    messages = await db.execute(
+        delete(Message).where(
+            Message.created_at < now - timedelta(days=MESSAGE_RETENTION_DAYS)
+        )
+    )
+    pending = await db.execute(
+        delete(PendingConfirmation).where(
+            PendingConfirmation.created_at
+            < now - timedelta(minutes=PENDING_CONFIRMATION_MINUTES)
+        )
+    )
+    await db.flush()
+
+    return messages.rowcount or 0, pending.rowcount or 0

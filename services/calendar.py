@@ -186,12 +186,10 @@ async def find_conflicting_events(
             continue
         if event.get("status") == "cancelled":
             continue
-        # All-day events carry "date" instead of "dateTime". Birthdays and
-        # holidays sit on the calendar all year and don't hold a time slot,
-        # so they'd false-positive on essentially everything
-        if "dateTime" not in event.get("start", {}):
-            continue
-        # transparency=transparent is Google's "show me as free"
+        # All-day events count. A trip or a day off is a real reason not to
+        # book something, and the transparency check below is what keeps
+        # birthdays and holidays out — those are marked free, and imported
+        # ones live on their own calendars rather than "primary" anyway
         if event.get("transparency") == "transparent":
             continue
         # An invite the user declined isn't holding the slot
