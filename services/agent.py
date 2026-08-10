@@ -5,6 +5,7 @@ what's actually there, then act on real event ids. Replies in gen-z tone.
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import monotonic
@@ -181,6 +182,7 @@ tone rules (non-negotiable):
 - all lowercase always
 - no emojis
 - no periods at the end of sentences ever
+- question marks are fine, use one whenever you are actually asking something
 - no em dashes or en dashes ever. replace with a comma or just end the thought
   bad: "added dentist — reminder set 1hr before"
   good: "added dentist, reminder 1hr before"
@@ -191,8 +193,8 @@ tone rules (non-negotiable):
   "added meeting with jake tomorrow at noon, reminder 1hr before"
   "moved saniyahs party to tomorrow at 12pm"
   "deleted office day"
-  "what time tho"
-  "u already have standup 3:00pm to 3:30pm then, still want dentist added"
+  "what time tho?"
+  "u already have standup 3:00pm to 3:30pm then, still want dentist added?"
   "couldn't find anything like that on ur calendar\""""
 
 
@@ -232,30 +234,46 @@ class AgentReply:
     pending_action: dict | None = None
 
 
-# Whole-message matches only. "yes but make it 4pm" is deliberately NOT a
-# confirmation — it falls through to the agent as a fresh request, which
-# re-checks. Better to re-ask than to write the wrong thing.
+# The obvious answers, matched instantly with no model call. Anything not in
+# here goes to interpret_confirmation rather than being written off — people
+# say "yuh", "bet", "go for it", and being made to repeat yourself is exactly
+# the friction this whole thing exists to remove.
 _CONFIRM_REPLIES = {
-    "y", "ye", "yes", "yea", "yeah", "yep", "yup", "sure", "ok", "okay", "k",
-    "fine", "confirm", "confirmed", "do it", "add it", "still add it", "add",
-    "anyway", "go ahead", "book it", "schedule it", "yes please", "yes pls",
-    # answers to "delete x, for real". "cancel it" is deliberately absent —
-    # it reads as decline when the question was "still want me to add x"
+    "y", "ye", "yes", "yea", "yeah", "yep", "yup", "yuh", "ya", "yah", "yh",
+    "sure", "ok", "okay", "kk", "k", "fine", "bet", "confirm", "confirmed",
+    "do it", "add it", "still add it", "add", "anyway", "go ahead", "go for it",
+    "book it", "schedule it", "yes please", "yes pls", "please", "pls",
+    # answers to "delete x?". "cancel it" is deliberately absent — it reads as
+    # decline when the question was "still want me to add x?"
     "delete it", "remove it", "yes delete", "delete",
 }
 
 _DECLINE_REPLIES = {
-    "n", "no", "nah", "nope", "nevermind", "never mind", "nvm", "cancel",
-    "skip", "skip it", "dont", "don't", "do not", "forget it", "leave it",
-    "no thanks", "no thx", "keep it",
+    "n", "no", "nah", "naw", "nope", "nvm", "nevermind", "never mind",
+    "cancel", "skip", "skip it", "dont", "don't", "do not", "forget it",
+    "leave it", "no thanks", "no thx", "keep it", "no dont", "actually no",
 }
+
+_CLASSIFIER_MODEL = "claude-haiku-4-5-20251001"
+
+_CLASSIFIER_PROMPT = """You classify a reply to a yes/no question from a calendar assistant.
+
+Answer with exactly one word, nothing else:
+confirm   - they are agreeing, they want it done
+decline   - they do not want it done
+unrelated - they are not answering the question, they changed the request, gave new details, or asked something else
+
+This is SMS. Slang, typos, lowercase and one word answers are completely normal.
+"yuh", "ya", "bet", "go for it", "yeye", "do it", "sure why not", "obvi" are all confirm.
+"nah", "nah im good", "actually dont", "wait no" are all decline.
+"yes but at 4pm", "make it friday instead", "what about tuesday" are unrelated — they changed what was being asked."""
 
 
 def classify_confirmation(text: str) -> str:
     """
-    Read a reply to a warning as "confirm", "decline", or "unrelated".
-    Plain string matching, no model call — this decides whether we write to
-    someone's calendar, so it should be predictable and cheap.
+    The instant path: obvious yes/no with no model call. Returns "confirm",
+    "decline", or "unrelated". "unrelated" here means "not obvious", not
+    "not an answer" — the caller should fall through to interpret_confirmation.
     """
     cleaned = text.strip().lower().strip(".!?,")
     if cleaned in _CONFIRM_REPLIES:
@@ -263,6 +281,44 @@ def classify_confirmation(text: str) -> str:
     if cleaned in _DECLINE_REPLIES:
         return "decline"
     return "unrelated"
+
+
+async def interpret_confirmation(question: str, reply: str) -> str:
+    """
+    Ask a small model to read an answer the word list didn't recognise.
+
+    It only ever decides yes / no / neither. What gets written was already
+    fixed and shown to the user when we asked, so a misread can at worst do
+    the thing they were looking at, never something else. On any error this
+    returns "unrelated", which routes to the normal agent — the safe default.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=_CLASSIFIER_MODEL,
+                max_tokens=5,
+                system=_CLASSIFIER_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": f"Question asked: {question}\nTheir reply: {reply}",
+                }],
+            ),
+            timeout=6.0,
+        )
+    except Exception as e:
+        logger.warning(f"Confirmation classifier failed: {e}")
+        return "unrelated"
+
+    raw = "".join(b.text for b in response.content if b.type == "text")
+    # Tolerate "Confirm." / "CONFIRM" / stray whitespace. Being fussy here just
+    # pushes a real answer into "unrelated" and makes the user say it twice.
+    word = re.sub(r"[^a-z]", "", raw.lower())
+    decision = word if word in ("confirm", "decline", "unrelated") else "unrelated"
+
+    if word != decision:
+        logger.warning(f"Classifier returned {raw!r}, treating as unrelated")
+    logger.info(f"Interpreted {reply!r} as {decision}")
+    return decision
 
 
 async def perform_confirmed_action(record: dict, service) -> str:
@@ -532,7 +588,7 @@ async def _apply_delete(event: dict, service, skip_checks: bool = False) -> Agen
 
     if not skip_checks:
         return AgentReply(
-            f"delete {_fmt_event_span(event, with_date=True)}, for real",
+            f"delete {_fmt_event_span(event, with_date=True)}?",
             pending_action={"action": "delete", "event": event},
         )
 
@@ -581,7 +637,7 @@ def _fmt_conflict_warning(
     list would let someone confirm a booking over something they never saw.
     """
     labels = [_fmt_event_span(e, with_date=multi_day) for e in conflicts]
-    verb = "move it there anyway" if moving else f"still want me to add {title.lower()}"
+    verb = "move it there anyway?" if moving else f"still want me to add {title.lower()}?"
 
     if len(labels) == 1:
         return f"u already have {labels[0]} then, {verb}"

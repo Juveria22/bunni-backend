@@ -27,7 +27,12 @@ from db.repo import (
     clear_pending_event,
 )
 from services.google_oauth import generate_auth_url, get_calendar_service_for_user
-from services.agent import run_agent, classify_confirmation, perform_confirmed_action
+from services.agent import (
+    run_agent,
+    classify_confirmation,
+    interpret_confirmation,
+    perform_confirmed_action,
+)
 from services.rate_limit import check_rate_limit
 from services.sms import send_sms, send_message
 #, send_vcard
@@ -143,7 +148,17 @@ async def _reply_out_of_band(phone: str, text: str, channel: str, refresh_token:
             # Resolved here, before the model is consulted — the decision to write
             # to someone's calendar shouldn't hinge on the model's read of history.
             pending = await get_pending_event(db, phone)
-            decision = classify_confirmation(text) if pending else "unrelated"
+
+            decision = "unrelated"
+            if pending:
+                # Obvious yes/no costs nothing. Anything else gets read by a
+                # small model rather than making them say it again — what
+                # would be written is already fixed and was shown to them.
+                decision = classify_confirmation(text)
+                if decision == "unrelated":
+                    decision = await interpret_confirmation(
+                        pending.get("question", ""), text
+                    )
 
             if pending and decision == "confirm":
                 await clear_pending_event(db, phone)
@@ -165,7 +180,11 @@ async def _reply_out_of_band(phone: str, text: str, channel: str, refresh_token:
                 result = await run_agent(text, calendar_service, history=history)
                 reply = result.text
                 if result.pending_action:
-                    await set_pending_event(db, phone, result.pending_action)
+                    # Keep the question alongside it — the classifier needs to
+                    # know what was asked to read the answer
+                    await set_pending_event(
+                        db, phone, {**result.pending_action, "question": reply}
+                    )
 
             # Only successful exchanges go in the transcript. Persisting a
             # "sumn went wrong" turn would poison context on the next text.
