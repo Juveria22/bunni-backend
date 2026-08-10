@@ -27,7 +27,11 @@ from db.repo import (
     set_pending_event,
     clear_pending_event,
 )
-from services.google_oauth import generate_auth_url, get_calendar_service_for_user
+from services.google_oauth import (
+    generate_auth_url,
+    build_calendar_service,
+    forget_calendar_service,
+)
 from services.agent import (
     run_agent,
     classify_confirmation,
@@ -154,55 +158,60 @@ async def _reply_out_of_band(phone: str, text: str, channel: str, refresh_token:
     """
     Runs after the webhook has already returned. Nothing here is on Twilio's
     clock, so a reply is always sent even if the agent takes its time.
+
+    Database sessions are opened around the queries and closed again before
+    anything slow. Holding one for the whole run meant a pooled connection was
+    tied up for as long as the agent thought — thirty concurrent messages would
+    have drained the pool and started failing.
     """
     reply = "sumn went wrong try again in a sec"
 
     try:
+        calendar_service = await build_calendar_service(refresh_token)
+
         async with get_db() as db:
-            calendar_service = get_calendar_service_for_user(refresh_token)
-
-            # If we asked "still want me to add it?", this text may be the answer.
-            # Resolved here, before the model is consulted — the decision to write
-            # to someone's calendar shouldn't hinge on the model's read of history.
             pending = await get_pending_event(db, phone)
+            history = await get_recent_messages(db, phone)
 
-            decision = "unrelated"
-            if pending:
-                # Obvious yes/no costs nothing. Anything else gets read by a
-                # small model rather than making them say it again — what
-                # would be written is already fixed and was shown to them.
-                decision = classify_confirmation(text)
-                if decision == "unrelated":
-                    decision = await interpret_confirmation(
-                        pending.get("question", ""), text
-                    )
+        # If we asked "still want me to add it?", this text may be the answer.
+        # Resolved before the model is consulted — the decision to write to
+        # someone's calendar shouldn't hinge on the model's read of history.
+        decision = "unrelated"
+        if pending:
+            # Obvious yes/no costs nothing. Anything else gets read by a small
+            # model rather than making them say it again — what would be
+            # written is already fixed and was shown to them.
+            decision = classify_confirmation(text)
+            if decision == "unrelated":
+                decision = await interpret_confirmation(pending.get("question", ""), text)
 
-            if pending and decision == "confirm":
+            # Consume it before acting, so a failure part way through can't be
+            # replayed by texting "yes" a second time
+            async with get_db() as db:
                 await clear_pending_event(db, phone)
-                reply = await perform_confirmed_action(pending, calendar_service)
-                logger.info(f"Confirmed {pending.get('action', 'create')} for {phone}")
 
-            elif pending and decision == "decline":
-                await clear_pending_event(db, phone)
-                reply = "bet, left it alone"
+        new_pending = None
 
-            else:
-                # Anything that isn't a plain yes/no drops the parked action and
-                # is handled as a fresh request. If it's still the same event,
-                # the clash check simply runs again.
-                if pending:
-                    await clear_pending_event(db, phone)
+        if pending and decision == "confirm":
+            reply = await perform_confirmed_action(pending, calendar_service)
+            logger.info(f"Confirmed {pending.get('action', 'create')} for {phone}")
 
-                history = await get_recent_messages(db, phone)
-                result = await run_agent(text, calendar_service, history=history)
-                reply = result.text
-                if result.pending_action:
-                    # Keep the question alongside it — the classifier needs to
-                    # know what was asked to read the answer
-                    await set_pending_event(
-                        db, phone, {**result.pending_action, "question": reply}
-                    )
+        elif pending and decision == "decline":
+            reply = "bet, left it alone"
 
+        else:
+            # Anything that isn't a plain yes/no drops the parked action and is
+            # handled as a fresh request. If it's still the same event, the
+            # clash check simply runs again.
+            result = await run_agent(text, calendar_service, history=history)
+            reply = result.text
+            new_pending = result.pending_action
+
+        async with get_db() as db:
+            if new_pending:
+                # Keep the question alongside it — the classifier needs to know
+                # what was asked to read the answer
+                await set_pending_event(db, phone, {**new_pending, "question": reply})
             # Only successful exchanges go in the transcript. Persisting a
             # "sumn went wrong" turn would poison context on the next text.
             await save_turn(db, phone, text, reply)
@@ -213,6 +222,7 @@ async def _reply_out_of_band(phone: str, text: str, channel: str, refresh_token:
         # meant any anthropic error mentioning max_tokens told the user to
         # reconnect their google account
         if "invalid_grant" in str(e).lower():
+            forget_calendar_service(refresh_token)
             reply = f"your google connection expired reconnect here: {generate_auth_url(phone)}"
 
     try:

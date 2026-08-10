@@ -24,11 +24,11 @@ SUCCESS_HTML = """
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>connected</title>
   <style>
-    body {{ font-family: system-ui, sans-serif; display: flex; align-items: center;
-            justify-content: center; min-height: 100vh; margin: 0; background: #f9f9f9; }}
-    .card {{ text-align: center; padding: 2rem; max-width: 400px; }}
-    h1 {{ font-size: 1.5rem; margin-bottom: 0.5rem; }}
-    p  {{ color: #666; font-size: 0.95rem; }}
+    body { font-family: system-ui, sans-serif; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; margin: 0; background: #f9f9f9; }
+    .card { text-align: center; padding: 2rem; max-width: 400px; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    p  { color: #666; font-size: 0.95rem; }
   </style>
 </head>
 <body>

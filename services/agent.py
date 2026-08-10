@@ -50,6 +50,11 @@ MAX_MODEL_CALLS = 4
 DEFAULT_LOOKAHEAD_DAYS = 30
 MAX_INSTANCES_PER_SERIES = 3
 
+# Rows pulled from Google (free, one call) vs rows shown to the model (paid for
+# as input tokens on every call). Thinning happens in between.
+FETCH_EVENTS = 250
+MAX_EVENTS_RETURNED = 40
+
 TOOLS = [
     {
         "name": "find_events",
@@ -399,16 +404,28 @@ async def run_agent(
             logger.info(f"Tool: {block.name} | {json.dumps(block.input)}")
 
             if block.name == "find_events":
-                found = await _handle_find(block.input, calendar_service)
+                try:
+                    payload = json.dumps(await _handle_find(block.input, calendar_service))
+                except ValueError as e:
+                    # Usually a date the model didn't write as YYYY-MM-DD.
+                    # Handing the error back lets it fix itself on the next
+                    # pass instead of killing the whole turn.
+                    logger.warning(f"find_events rejected {block.input}: {e}")
+                    payload = json.dumps({"error": f"bad input: {e}. dates must be YYYY-MM-DD"})
+
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(found),
+                    "content": payload,
                 })
                 continue
 
             # Everything else writes, and writing ends the turn
-            return await _run_write_tool(block, calendar_service)
+            try:
+                return await _run_write_tool(block, calendar_service)
+            except (ValueError, KeyError) as e:
+                logger.warning(f"{block.name} rejected {block.input}: {e}")
+                return AgentReply("couldn't work out the date on that, say it again?")
 
         if not results:
             logger.warning("Model signalled tool_use but sent no tool blocks")
@@ -453,14 +470,18 @@ async def _handle_find(args: dict, service) -> list[dict]:
     if end < start:
         start, end = end, start
 
+    # Fetch generously and thin afterwards. Fetching only as many as we intend
+    # to show meant a daily standup ate the whole allowance before thinning
+    # ever ran, and genuine one-off events fell off the end of the window.
     events = await list_events(
         service,
         time_min=datetime.combine(start, datetime.min.time(), tzinfo=TIMEZONE),
         time_max=datetime.combine(end + timedelta(days=1), datetime.min.time(), tzinfo=TIMEZONE),
         query=args.get("query"),
+        max_results=FETCH_EVENTS,
     )
 
-    kept = _thin_recurring(events)
+    kept = _thin_recurring(events)[:MAX_EVENTS_RETURNED]
     summaries = [summarize_event(e) for e in kept]
     logger.info(
         f"find_events {start}..{end} -> {len(summaries)} events "
@@ -493,6 +514,20 @@ def _thin_recurring(events: list[dict]) -> list[dict]:
 
 
 # ---------- writing ----------
+
+def _slim_event(event: dict) -> dict:
+    """
+    Just the fields a parked action needs to replay. A Google event carries
+    attendees, conference links, reminder overrides and more, and the whole
+    thing was being serialised into the pending row for a yes/no.
+    """
+    return {
+        "id": event.get("id"),
+        "summary": event.get("summary"),
+        "start": event.get("start", {}),
+        "end": event.get("end", {}),
+    }
+
 
 def _is_all_day(args: dict) -> bool:
     """
@@ -602,7 +637,7 @@ async def _apply_reschedule(
             logger.info(f"Conflict moving {title}: {[c.get('summary') for c in conflicts]}")
             return AgentReply(
                 _fmt_conflict_warning(title, conflicts, multi_day=all_day, moving=True),
-                pending_action={"action": "reschedule", "args": args, "event": event},
+                pending_action={"action": "reschedule", "args": args, "event": _slim_event(event)},
             )
 
     await update_event_time(
@@ -640,7 +675,7 @@ async def _apply_delete(event: dict, service, skip_checks: bool = False) -> Agen
     if not skip_checks:
         return AgentReply(
             f"delete {_fmt_event_span(event, with_date=True)}?",
-            pending_action={"action": "delete", "event": event},
+            pending_action={"action": "delete", "event": _slim_event(event)},
         )
 
     await delete_event(service, event["id"])

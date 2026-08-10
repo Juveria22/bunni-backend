@@ -5,12 +5,14 @@ Google OAuth2 service.
 - Builds per-user calendar clients from stored refresh tokens
 """
 
+import asyncio
 import os
 import hmac
 import hashlib
 import base64
 import json
 import logging
+from time import monotonic
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
@@ -114,7 +116,12 @@ def exchange_code_for_tokens(code: str) -> tuple[str, str]:
 # ─────────────────────────────────────────────
 
 def get_calendar_service_for_user(refresh_token: str):
-    """Build a Google Calendar service using a specific user's refresh token."""
+    """
+    Build a Google Calendar service using a specific user's refresh token.
+
+    Blocking: creds.refresh is an http round trip to Google. Call it through
+    build_calendar_service rather than directly from a coroutine.
+    """
     creds = Credentials(
         token=None,
         refresh_token=refresh_token,
@@ -125,3 +132,32 @@ def get_calendar_service_for_user(refresh_token: str):
     )
     creds.refresh(GoogleRequest())
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+# Access tokens are good for an hour. Rebuilding the client on every message
+# meant a round trip to Google's token endpoint before we could do anything,
+# on every single text. Keyed by refresh token, which is the user identity here.
+_SERVICE_TTL_SECONDS = 45 * 60
+_MAX_CACHED_SERVICES = 500
+_service_cache: dict[str, tuple[float, object]] = {}
+
+
+async def build_calendar_service(refresh_token: str):
+    """A calendar client for this user, reused until its access token nears expiry."""
+    cached = _service_cache.get(refresh_token)
+    if cached and cached[0] > monotonic():
+        return cached[1]
+
+    # Off the event loop — the token refresh inside is blocking http
+    service = await asyncio.to_thread(get_calendar_service_for_user, refresh_token)
+
+    if len(_service_cache) >= _MAX_CACHED_SERVICES:
+        # Small, blunt, and bounded. These are cheap to rebuild.
+        _service_cache.clear()
+    _service_cache[refresh_token] = (monotonic() + _SERVICE_TTL_SECONDS, service)
+    return service
+
+
+def forget_calendar_service(refresh_token: str) -> None:
+    """Drop a cached client, e.g. after Google rejects the refresh token."""
+    _service_cache.pop(refresh_token, None)
