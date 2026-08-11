@@ -11,7 +11,11 @@ from fastapi.responses import HTMLResponse
 
 from db.session import get_db
 from db.repo import save_google_tokens
-from services.google_oauth import decode_state, exchange_code_for_tokens
+from services.google_oauth import (
+    decode_state,
+    exchange_code_for_tokens,
+    MissingRefreshToken,
+)
 from services.sms import send_sms
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,23 @@ ERROR_HTML = """
 </html>
 """
 
+# Google only issues a refresh token on a genuinely new grant. If the account
+# already has one outstanding it can hand back an access token alone, which is
+# useless to us — we need to act on the calendar hours later, not just now.
+NO_REFRESH_TOKEN_HTML = """
+<!DOCTYPE html>
+<html>
+<head><meta name="viewport" content="width=device-width, initial-scale=1"><title>almost there</title></head>
+<body style="font-family:system-ui;text-align:center;padding:3rem;max-width:26rem;margin:0 auto">
+  <h1 style="font-size:1.4rem">almost there</h1>
+  <p style="color:#666">google didn't give us permission to manage your calendar later on.</p>
+  <p style="color:#666">remove gcal at
+    <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>,
+    then text the agent for a fresh link.</p>
+</body>
+</html>
+"""
+
 
 @router.get("/oauth/callback", response_class=HTMLResponse)
 async def oauth_callback(request: Request, code: str = None, state: str = None, error: str = None):
@@ -67,6 +88,11 @@ async def oauth_callback(request: Request, code: str = None, state: str = None, 
 
     try:
         refresh_token, email = exchange_code_for_tokens(code)
+    except MissingRefreshToken:
+        # Nothing is stored, so they aren't left half-connected. Revoking is
+        # what makes Google hand one over on the next attempt.
+        logger.warning(f"No refresh token returned for {phone}")
+        return HTMLResponse(NO_REFRESH_TOKEN_HTML, status_code=400)
     except Exception as e:
         logger.exception(f"Token exchange failed for {phone}: {e}")
         return HTMLResponse(ERROR_HTML, status_code=500)

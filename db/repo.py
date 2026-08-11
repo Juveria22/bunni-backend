@@ -50,6 +50,11 @@ async def save_google_tokens(
     refresh_token: str,
     email: str,
 ) -> User:
+    # is_onboarded is "has a refresh token", so writing an empty one would
+    # mark the account connected while leaving it unable to do anything
+    if not refresh_token:
+        raise ValueError("refusing to save an empty refresh token")
+
     user = await get_user(db, phone)
     if not user:
         user = User(phone_number=phone)

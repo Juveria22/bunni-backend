@@ -12,6 +12,7 @@ import hashlib
 import base64
 import json
 import logging
+from datetime import datetime, timezone
 from time import monotonic
 
 from google.oauth2.credentials import Credentials
@@ -90,14 +91,28 @@ def generate_auth_url(phone: str) -> str:
     return auth_url
 
 
+class MissingRefreshToken(Exception):
+    """
+    Google returned an access token but no refresh token.
+
+    prompt="consent" is supposed to prevent this, but Google withholds one in
+    some re-authorisation cases. Storing the null would leave the account
+    looking un-onboarded forever, so the user gets told to retry instead.
+    """
+
+
 def exchange_code_for_tokens(code: str) -> tuple[str, str]:
     """
     Exchange OAuth code for tokens.
-    Returns (refresh_token, email).
+    Returns (refresh_token, email). Raises MissingRefreshToken if Google
+    didn't give us one — without it we can't act on their calendar later.
     """
     flow = _make_flow()
     flow.fetch_token(code=code)
     creds = flow.credentials
+
+    if not creds.refresh_token:
+        raise MissingRefreshToken("Google returned no refresh token")
 
     # Get user's email
     email = "unknown"
@@ -115,49 +130,70 @@ def exchange_code_for_tokens(code: str) -> tuple[str, str]:
 # Per-user calendar client
 # ─────────────────────────────────────────────
 
-def get_calendar_service_for_user(refresh_token: str):
-    """
-    Build a Google Calendar service using a specific user's refresh token.
+# What's cached is the access token, a plain string — NOT the built client.
+# google-api-python-client sits on httplib2, which is not thread safe, and
+# every call goes through asyncio.to_thread. Two messages from the same user
+# arriving together would have shared one Http object across threads.
+# Caching the token still skips the round trip to Google, which was the
+# expensive part; assembling the client is local.
+_TOKEN_REFRESH_MARGIN_SECONDS = 5 * 60
+_FALLBACK_TOKEN_TTL_SECONDS = 30 * 60
+_MAX_CACHED_TOKENS = 1000
+_token_cache: dict[str, tuple[float, str]] = {}
 
-    Blocking: creds.refresh is an http round trip to Google. Call it through
-    build_calendar_service rather than directly from a coroutine.
-    """
-    creds = Credentials(
-        token=None,
+
+def _credentials(refresh_token: str, access_token: str | None = None) -> Credentials:
+    return Credentials(
+        token=access_token,
         refresh_token=refresh_token,
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
         token_uri="https://oauth2.googleapis.com/token",
         scopes=SCOPES,
     )
+
+
+def _fetch_access_token(refresh_token: str) -> tuple[str, float]:
+    """Blocking: an http round trip to Google. Returns (token, expiry monotonic)."""
+    creds = _credentials(refresh_token)
     creds.refresh(GoogleRequest())
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    ttl = _FALLBACK_TOKEN_TTL_SECONDS
+    if creds.expiry:
+        # google-auth stores expiry as a naive utc datetime
+        ttl = (creds.expiry - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
+
+    return creds.token, monotonic() + max(ttl - _TOKEN_REFRESH_MARGIN_SECONDS, 60)
 
 
-# Access tokens are good for an hour. Rebuilding the client on every message
-# meant a round trip to Google's token endpoint before we could do anything,
-# on every single text. Keyed by refresh token, which is the user identity here.
-_SERVICE_TTL_SECONDS = 45 * 60
-_MAX_CACHED_SERVICES = 500
-_service_cache: dict[str, tuple[float, object]] = {}
+def _build_service(refresh_token: str, access_token: str):
+    """Blocking: reads the bundled discovery document. No network."""
+    return build(
+        "calendar", "v3",
+        credentials=_credentials(refresh_token, access_token),
+        cache_discovery=False,
+    )
 
 
 async def build_calendar_service(refresh_token: str):
-    """A calendar client for this user, reused until its access token nears expiry."""
-    cached = _service_cache.get(refresh_token)
+    """
+    A calendar client for this user. The access token is reused until it's
+    close to expiring; the client itself is built fresh so nothing mutable is
+    shared between threads.
+    """
+    cached = _token_cache.get(refresh_token)
+
     if cached and cached[0] > monotonic():
-        return cached[1]
+        access_token = cached[1]
+    else:
+        access_token, expires_at = await asyncio.to_thread(_fetch_access_token, refresh_token)
+        if len(_token_cache) >= _MAX_CACHED_TOKENS:
+            _token_cache.clear()  # blunt and bounded, they're cheap to refetch
+        _token_cache[refresh_token] = (expires_at, access_token)
 
-    # Off the event loop — the token refresh inside is blocking http
-    service = await asyncio.to_thread(get_calendar_service_for_user, refresh_token)
-
-    if len(_service_cache) >= _MAX_CACHED_SERVICES:
-        # Small, blunt, and bounded. These are cheap to rebuild.
-        _service_cache.clear()
-    _service_cache[refresh_token] = (monotonic() + _SERVICE_TTL_SECONDS, service)
-    return service
+    return await asyncio.to_thread(_build_service, refresh_token, access_token)
 
 
 def forget_calendar_service(refresh_token: str) -> None:
-    """Drop a cached client, e.g. after Google rejects the refresh token."""
-    _service_cache.pop(refresh_token, None)
+    """Drop a cached token, e.g. after Google rejects the refresh token."""
+    _token_cache.pop(refresh_token, None)
