@@ -6,6 +6,8 @@ Uses a simple sliding window counter.
 
 import os
 import logging
+from time import monotonic
+
 import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,32 @@ async def check_rate_limit(phone: str) -> bool:
             return False
         return True
     except Exception as e:
-        # If Redis is down, fail open — don't block the user
-        logger.error(f"Rate limit check failed (Redis?): {e}")
-        return True
+        # Redis being down must not take the app offline, but failing fully
+        # open means every message runs the agent with no ceiling at all —
+        # a misconfigured REDIS_URL would quietly uncap the anthropic bill.
+        logger.error(f"Rate limit check failed (Redis?), falling back in-process: {e}")
+        return _local_check(phone)
+
+
+# Per-process fallback. Less accurate than Redis across workers, but the point
+# is a ceiling that still exists when Redis doesn't.
+_local_counts: dict[str, tuple[float, int]] = {}
+
+
+def _local_check(phone: str) -> bool:
+    now = monotonic()
+    window_start, count = _local_counts.get(phone, (now, 0))
+
+    if now - window_start >= WINDOW_SECONDS:
+        window_start, count = now, 0
+
+    count += 1
+    _local_counts[phone] = (window_start, count)
+
+    if len(_local_counts) > 10_000:  # bounded, it's a fallback
+        _local_counts.clear()
+
+    if count > RATE_LIMIT:
+        logger.warning(f"Rate limited in-process: {phone} ({count} requests)")
+        return False
+    return True

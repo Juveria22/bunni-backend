@@ -15,12 +15,17 @@ import logging
 from datetime import datetime, timezone
 from time import monotonic
 
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 
 logger = logging.getLogger(__name__)
+
+# Every google call is bounded by this. Well inside the 60s turn deadline.
+GOOGLE_HTTP_TIMEOUT_SECONDS = 15
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CALENDAR_ID = "primary"
@@ -168,11 +173,14 @@ def _fetch_access_token(refresh_token: str) -> tuple[str, float]:
 
 def _build_service(refresh_token: str, access_token: str):
     """Blocking: reads the bundled discovery document. No network."""
-    return build(
-        "calendar", "v3",
-        credentials=_credentials(refresh_token, access_token),
-        cache_discovery=False,
+    # httplib2 has no default socket timeout, so a stalled connection to Google
+    # hangs the worker thread indefinitely. asyncio.wait_for can free the caller
+    # but cannot kill the thread, so the bound has to be set down here.
+    authed = AuthorizedHttp(
+        _credentials(refresh_token, access_token),
+        http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT_SECONDS),
     )
+    return build("calendar", "v3", http=authed, cache_discovery=False)
 
 
 async def build_calendar_service(refresh_token: str):

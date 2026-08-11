@@ -6,7 +6,8 @@ import json
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
-from db.models import User, Message, PendingConfirmation
+from sqlalchemy.exc import IntegrityError
+from db.models import User, Message, PendingConfirmation, SentReminder
 
 # How much conversation the agent gets to see. SMS threads are bursty —
 # a text an hour later is almost always a new topic, and stale context
@@ -26,6 +27,10 @@ PENDING_CONFIRMATION_MINUTES = 30
 # room to debug a complaint, and holding people's message text indefinitely
 # when nothing reads it is storage and privacy exposure for nothing.
 MESSAGE_RETENTION_DAYS = 7
+
+# Reminder rows only exist to stop a second send. Once the event is well past,
+# nothing can re-trigger it, so they're dead weight.
+REMINDER_RETENTION_DAYS = 2
 
 
 async def get_user(db: AsyncSession, phone: str) -> User | None:
@@ -152,6 +157,37 @@ async def clear_pending_event(db: AsyncSession, phone: str) -> None:
     await db.flush()
 
 
+async def list_onboarded_users(db: AsyncSession) -> list[tuple[str, str]]:
+    """(phone, refresh_token) for everyone the reminder sweep should look at."""
+    result = await db.execute(
+        select(User.phone_number, User.google_refresh_token)
+        .where(User.google_refresh_token.is_not(None))
+    )
+    return [(row[0], row[1]) for row in result.all()]
+
+
+async def claim_reminder(db: AsyncSession, phone: str, event_id: str, kind: str) -> bool:
+    """
+    Try to become the one who sends this reminder. True means claimed, send it;
+    False means somebody already did.
+
+    The insert is the lock — the primary key rejects a duplicate — so this is
+    safe across workers without any coordination. It runs in a savepoint so a
+    losing race doesn't poison the surrounding transaction.
+    """
+    try:
+        async with db.begin_nested():
+            db.add(SentReminder(
+                phone_number=phone,
+                event_id=event_id[:1024],
+                kind=kind,
+                sent_at=datetime.now(timezone.utc),
+            ))
+        return True
+    except IntegrityError:
+        return False
+
+
 async def prune_old_data(db: AsyncSession) -> tuple[int, int]:
     """
     Drop transcript rows past the retention window, and any parked confirmation
@@ -171,6 +207,11 @@ async def prune_old_data(db: AsyncSession) -> tuple[int, int]:
         delete(PendingConfirmation).where(
             PendingConfirmation.created_at
             < now - timedelta(minutes=PENDING_CONFIRMATION_MINUTES)
+        )
+    )
+    await db.execute(
+        delete(SentReminder).where(
+            SentReminder.sent_at < now - timedelta(days=REMINDER_RETENTION_DAYS)
         )
     )
     await db.flush()

@@ -15,6 +15,7 @@ from db.models import Base
 from db.repo import prune_old_data
 from routers.sms import router as sms_router
 from routers.oauth import router as oauth_router
+from services.reminders import reminder_loop
 
 PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 
@@ -52,15 +53,16 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ready")
 
-    pruner = asyncio.create_task(_prune_loop())
+    background = [
+        asyncio.create_task(_prune_loop()),
+        asyncio.create_task(reminder_loop()),
+    ]
 
     yield
 
-    pruner.cancel()
-    try:
-        await pruner
-    except asyncio.CancelledError:
-        pass
+    for task in background:
+        task.cancel()
+    await asyncio.gather(*background, return_exceptions=True)
     await engine.dispose()
 
 

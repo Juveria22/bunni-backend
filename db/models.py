@@ -73,6 +73,31 @@ class Message(Base):
     )
 
 
+class SentReminder(Base):
+    """
+    One row per reminder actually sent. The primary key is what makes sending
+    idempotent: every worker running the sweep tries to insert first and only
+    texts if the insert won, so two workers can't both remind about the same
+    event, and a restart mid-sweep can't send twice.
+    """
+
+    __tablename__ = "sent_reminders"
+
+    phone_number = Column(
+        String(20),
+        ForeignKey("users.phone_number", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    event_id = Column(String(1024), primary_key=True)
+    kind = Column(String(16), primary_key=True)  # "soon" | "now"
+
+    sent_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
 class PendingConfirmation(Base):
     """
     An event creation that clashed with something already on the calendar and
