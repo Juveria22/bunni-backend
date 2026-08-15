@@ -1,8 +1,9 @@
 """
-Google OAuth2 service.
-- Generates per-user auth URLs with state param (phone number, signed)
-- Handles the callback and stores tokens per user
-- Builds per-user calendar clients from stored refresh tokens
+google oauth2, turning a text message into a calendar we can touch
+
+per user auth urls with a signed, single use, expiring state param
+redeems the callback, revokes a grant on request
+using the access once we have it lives in google_client.py
 """
 
 import asyncio
@@ -12,60 +13,75 @@ import hashlib
 import base64
 import json
 import logging
-from datetime import datetime, timezone
-from time import monotonic
+from time import time
 
-import httplib2
-from google_auth_httplib2 import AuthorizedHttp
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GoogleRequest
-from googleapiclient.discovery import build
+import httpx
+from googleapiclient.discovery import build as build_service
 from google_auth_oauthlib.flow import Flow
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.repo import create_oauth_state, consume_oauth_state, OAUTH_STATE_MINUTES
+from services.google_client import (
+    CLIENT_ID,
+    CLIENT_SECRET,
+    SCOPES,
+    GOOGLE_HTTP_TIMEOUT_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
-# Every google call is bounded by this. Well inside the 60s turn deadline.
-GOOGLE_HTTP_TIMEOUT_SECONDS = 15
+REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]  # https://yourapp.railway.app/oauth/callback
+STATE_SECRET = os.environ["STATE_SECRET"]  # any random 32 char string, hmac signing key
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-CALENDAR_ID = "primary"
-
-CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
-CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
-REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]  # e.g. https://yourapp.railway.app/oauth/callback
-STATE_SECRET = os.environ["STATE_SECRET"]  # any random 32-char string for HMAC signing
+_STATE_MAX_AGE_SECONDS = OAUTH_STATE_MINUTES * 60
 
 
 # ─────────────────────────────────────────────
-# State token — encodes phone number securely
-# so we know which user is coming back from Google
+# state token
+#
+# the only thing binding a consent screen to a phone number, so a signature
+# alone is not enough. a state that never expires and replays is a permanent
+# bearer token, forwarding your own link to a target is enough to bind their
+# google account to your number
+#
+# three properties close it: an iat bounds the window, a server side nonce makes
+# redemption single use, the signature stops both being edited
 # ─────────────────────────────────────────────
 
 def _sign(payload: str) -> str:
-    sig = hmac.new(STATE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
-    return sig
+    return hmac.new(STATE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def encode_state(phone: str) -> str:
-    payload = base64.urlsafe_b64encode(json.dumps({"phone": phone}).encode()).decode()
-    sig = _sign(payload)
-    return f"{payload}.{sig}"
+def encode_state(phone: str, nonce: str) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"phone": phone, "nonce": nonce, "iat": int(time())}).encode()
+    ).decode()
+    return f"{payload}.{_sign(payload)}"
 
 
-def decode_state(state: str) -> str | None:
-    """Returns phone number, or None if state is invalid/tampered."""
+def decode_state(state: str) -> tuple[str, str] | None:
+    """
+    (phone, nonce), or None if invalid, tampered with, or too old
+    the nonce still has to be redeemed against the db to mean anything
+    """
     try:
         payload, sig = state.rsplit(".", 1)
         if not hmac.compare_digest(_sign(payload), sig):
             return None
         data = json.loads(base64.urlsafe_b64decode(payload).decode())
-        return data["phone"]
+
+        issued_at = int(data["iat"])
+        if abs(time() - issued_at) > _STATE_MAX_AGE_SECONDS:
+            logger.warning("OAuth state rejected: outside the validity window")
+            return None
+
+        return data["phone"], data["nonce"]
     except Exception:
         return None
 
 
 # ─────────────────────────────────────────────
-# OAuth flow
+# oauth flow
 # ─────────────────────────────────────────────
 
 def _make_flow() -> Flow:
@@ -83,35 +99,54 @@ def _make_flow() -> Flow:
     )
 
 
-def generate_auth_url(phone: str) -> str:
-    """Generate a Google OAuth URL that encodes the user's phone in state."""
+async def generate_auth_url(db: AsyncSession, phone: str) -> str:
+    """auth url, one use, this phone number, next OAUTH_STATE_MINUTES"""
+    nonce = await create_oauth_state(db, phone)
     flow = _make_flow()
-    state = encode_state(phone)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        prompt="consent",       # always return refresh token
-        state=state,
+        prompt="consent",       # ask for a refresh token every time
+        state=encode_state(phone, nonce),
         include_granted_scopes="true",
     )
     return auth_url
 
 
+async def resolve_state(db: AsyncSession, state: str) -> str | None:
+    """
+    the phone this callback belongs to, None if forged, expired, or used
+    redemption is atomic so a link works once
+    """
+    decoded = decode_state(state)
+    if decoded is None:
+        return None
+
+    phone, nonce = decoded
+    claimed = await consume_oauth_state(db, nonce)
+
+    if claimed is None:
+        logger.warning("OAuth state rejected: nonce already used or expired")
+        return None
+    if claimed != phone:
+        # signature and stored row disagree, should be impossible
+        logger.error("OAuth state rejected: nonce/phone mismatch")
+        return None
+
+    return phone
+
+
 class MissingRefreshToken(Exception):
     """
-    Google returned an access token but no refresh token.
+    google returned an access token but no refresh token
 
-    prompt="consent" is supposed to prevent this, but Google withholds one in
-    some re-authorisation cases. Storing the null would leave the account
-    looking un-onboarded forever, so the user gets told to retry instead.
+    prompt="consent" should prevent it, but google still withholds one on some
+    re auths. storing the null leaves the account looking un onboarded forever,
+    so the user is told to retry instead
     """
 
 
-def exchange_code_for_tokens(code: str) -> tuple[str, str]:
-    """
-    Exchange OAuth code for tokens.
-    Returns (refresh_token, email). Raises MissingRefreshToken if Google
-    didn't give us one — without it we can't act on their calendar later.
-    """
+def _exchange_code_for_tokens(code: str) -> tuple[str, str]:
+    """blocking, two http round trips. never call from the event loop directly"""
     flow = _make_flow()
     flow.fetch_token(code=code)
     creds = flow.credentials
@@ -119,89 +154,37 @@ def exchange_code_for_tokens(code: str) -> tuple[str, str]:
     if not creds.refresh_token:
         raise MissingRefreshToken("Google returned no refresh token")
 
-    # Get user's email
     email = "unknown"
     try:
-        import googleapiclient.discovery as gd
-        service = gd.build("oauth2", "v2", credentials=creds)
+        service = build_service("oauth2", "v2", credentials=creds)
         email = service.userinfo().get().execute().get("email", "unknown")
     except Exception as e:
-        logger.warning(f"Could not fetch email (non-fatal): {e}")
+        logger.warning(f"Could not fetch email (non fatal): {e}")
 
     return creds.refresh_token, email
 
 
-# ─────────────────────────────────────────────
-# Per-user calendar client
-# ─────────────────────────────────────────────
-
-# What's cached is the access token, a plain string — NOT the built client.
-# google-api-python-client sits on httplib2, which is not thread safe, and
-# every call goes through asyncio.to_thread. Two messages from the same user
-# arriving together would have shared one Http object across threads.
-# Caching the token still skips the round trip to Google, which was the
-# expensive part; assembling the client is local.
-_TOKEN_REFRESH_MARGIN_SECONDS = 5 * 60
-_FALLBACK_TOKEN_TTL_SECONDS = 30 * 60
-_MAX_CACHED_TOKENS = 1000
-_token_cache: dict[str, tuple[float, str]] = {}
-
-
-def _credentials(refresh_token: str, access_token: str | None = None) -> Credentials:
-    return Credentials(
-        token=access_token,
-        refresh_token=refresh_token,
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        token_uri="https://oauth2.googleapis.com/token",
-        scopes=SCOPES,
-    )
-
-
-def _fetch_access_token(refresh_token: str) -> tuple[str, float]:
-    """Blocking: an http round trip to Google. Returns (token, expiry monotonic)."""
-    creds = _credentials(refresh_token)
-    creds.refresh(GoogleRequest())
-
-    ttl = _FALLBACK_TOKEN_TTL_SECONDS
-    if creds.expiry:
-        # google-auth stores expiry as a naive utc datetime
-        ttl = (creds.expiry - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
-
-    return creds.token, monotonic() + max(ttl - _TOKEN_REFRESH_MARGIN_SECONDS, 60)
-
-
-def _build_service(refresh_token: str, access_token: str):
-    """Blocking: reads the bundled discovery document. No network."""
-    # httplib2 has no default socket timeout, so a stalled connection to Google
-    # hangs the worker thread indefinitely. asyncio.wait_for can free the caller
-    # but cannot kill the thread, so the bound has to be set down here.
-    authed = AuthorizedHttp(
-        _credentials(refresh_token, access_token),
-        http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT_SECONDS),
-    )
-    return build("calendar", "v3", http=authed, cache_discovery=False)
-
-
-async def build_calendar_service(refresh_token: str):
+async def exchange_code_for_tokens(code: str) -> tuple[str, str]:
     """
-    A calendar client for this user. The access token is reused until it's
-    close to expiring; the client itself is built fresh so nothing mutable is
-    shared between threads.
+    swap the oauth code for tokens, returns (refresh_token, email)
+
+    threaded because both calls inside are blocking https round trips, on the
+    event loop they stall every concurrent webhook for their combined duration
     """
-    cached = _token_cache.get(refresh_token)
-
-    if cached and cached[0] > monotonic():
-        access_token = cached[1]
-    else:
-        access_token, expires_at = await asyncio.to_thread(_fetch_access_token, refresh_token)
-        if len(_token_cache) >= _MAX_CACHED_TOKENS:
-            _token_cache.clear()  # blunt and bounded, they're cheap to refetch
-        _token_cache[refresh_token] = (expires_at, access_token)
-
-    return await asyncio.to_thread(_build_service, refresh_token, access_token)
+    return await asyncio.to_thread(_exchange_code_for_tokens, code)
 
 
-def forget_calendar_service(refresh_token: str) -> None:
-    """Drop a cached token, e.g. after Google rejects the refresh token."""
-    _token_cache.pop(refresh_token, None)
+async def revoke_refresh_token(refresh_token: str) -> None:
+    """
+    tell google to forget the grant, best effort
+    used on STOP, the local delete is what matters and a network failure here
+    should not block it
+    """
+    try:
+        async with httpx.AsyncClient(timeout=GOOGLE_HTTP_TIMEOUT_SECONDS) as client:
+            await client.post(
+                "https://oauth2.googleapis.com/revoke",
+                data={"token": refresh_token},
+            )
+    except Exception as e:
+        logger.warning(f"Could not revoke google grant (non fatal): {e}")

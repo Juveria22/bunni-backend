@@ -1,6 +1,7 @@
 """
-Google Calendar operations. Every function takes a `service` object
-that's already scoped to a specific user's credentials.
+google calendar operations
+every function takes a service already scoped to one user's credentials
+also owns the timezone and the date/time math the agent reasons over
 """
 
 import asyncio
@@ -11,27 +12,37 @@ from zoneinfo import ZoneInfo
 
 from googleapiclient.errors import HttpError
 
+from services.sanitize import scrub
+
 logger = logging.getLogger(__name__)
 CALENDAR_ID = "primary"
+
+# google's own all day default, 9am the day before
+# all day reminders count back from midnight, so the normal 60 minute default
+# would fire at 11pm the previous night
+ALL_DAY_REMINDER_MINUTES = 900
+
+# google rejects more than five reminder overrides per event
+# we emit popup + email per offset, so three offsets made six and the patch
+# failed with a generic error that retrying could never fix
+MAX_REMINDER_OVERRIDES = 5
 
 
 async def _execute(request):
     """
-    Google's python client is synchronous. Calling .execute() directly from a
-    coroutine blocks the whole event loop for the length of the http round
-    trip, which stalls every other user's webhook. Hand it to a thread.
+    google's python client is sync, .execute() from a coroutine blocks the whole
+    event loop for the http round trip and stalls every other webhook
     """
     return await asyncio.to_thread(request.execute)
 
-# Users are in eastern time. This must be a named zone, not a fixed offset —
-# a hardcoded -04:00 is EDT and silently books everything an hour early once
-# EST starts in november.
+# named zone, not a fixed offset
+# a hardcoded -04:00 is edt and books everything an hour early once est starts
 TIMEZONE_NAME = "America/New_York"
 TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 
 
 def now_local() -> datetime:
-    """Current time in the user's zone. Use this for anything date-shaped."""
+    """now in the user's zone, use for anything date shaped"""
     return datetime.now(TIMEZONE)
 
 
@@ -41,12 +52,11 @@ def parse_event_window(
     duration_minutes: int = 60,
 ) -> tuple[datetime, datetime]:
     """
-    (start, end) for an event. Shared by create_event and the conflict check
-    so both reason about exactly the same slot.
+    (start, end) for a timed event
+    shared by create and the clash check so both reason about the same slot
 
-    The offset is derived from the date, so it's -04:00 in summer and -05:00
-    in winter. Duration is added in UTC so an event spanning a dst change is
-    still the length the user asked for.
+    offset comes off the date, -04:00 in summer, -05:00 in winter
+    duration is added in utc so an event over a dst change keeps its length
     """
     start_dt = datetime.fromisoformat(f"{date}T{start_time}:00").replace(tzinfo=TIMEZONE)
     end_dt = (
@@ -57,9 +67,8 @@ def parse_event_window(
 
 def all_day_window(date: str, end_date: str | None = None) -> tuple[datetime, datetime]:
     """
-    The real span an all-day event blocks: local midnight on the first day
-    through local midnight after the last. Used to find what it collides with,
-    since "all day" means the whole day, not a slot at 00:00.
+    real span an all day event blocks, local midnight to local midnight after
+    the last day. used for clash checks, all day means the whole day not 00:00
     """
     start_day = datetime.fromisoformat(date).date()
     last_day = datetime.fromisoformat(end_date).date() if end_date else start_day
@@ -77,11 +86,11 @@ def build_time_body(
     end_date: str | None = None,
 ) -> dict:
     """
-    The start/end half of an event body, shared by create and reschedule.
+    the start/end half of an event body, shared by create and reschedule
 
-    All-day events use plain dates with no time at all — that's what makes
-    Google render them in the top strip instead of at midnight. Google treats
-    `end` as exclusive, so a one-day event ends on the following day.
+    all day events use plain dates with no time, that is what puts them in the
+    top strip instead of at midnight. google's end is exclusive, so a one day
+    event ends on the following day
     """
     if all_day:
         start_day = datetime.fromisoformat(date).date()
@@ -100,8 +109,8 @@ def build_time_body(
 
 def read_event_window(event: dict) -> tuple[str, str | None, int, bool]:
     """
-    (date, start_time, duration_minutes, all_day) for an existing event, so a
-    reschedule can keep whatever the user didn't ask to change.
+    (date, start_time, duration_minutes, all_day) for an existing event
+    lets a reschedule keep whatever the user did not ask to change
     """
     start, end = event.get("start", {}), event.get("end", {})
 
@@ -116,11 +125,10 @@ def read_event_window(event: dict) -> tuple[str, str | None, int, bool]:
 
 def all_day_span_days(event: dict) -> int:
     """
-    How many days an all-day event covers. Google's `end` is exclusive, so a
-    single day spans 1. Anything that isn't all-day spans 1 too.
+    how many days an all day event covers, google's end is exclusive so one day
+    spans 1. anything not all day spans 1 too
 
-    Needed on reschedule: without it, moving a five day trip rebuilds it with
-    end = start + 1 and quietly throws away four days.
+    needed on reschedule, without it moving a five day trip rebuilds it as one
     """
     start, end = event.get("start", {}), event.get("end", {})
     if "date" not in start or "date" not in end:
@@ -140,9 +148,10 @@ async def update_event_time(
     end_date: str | None = None,
 ) -> dict:
     """
-    Move an existing event. Patch replaces the whole start/end objects, so
-    switching a timed event to all-day drops its dateTime rather than leaving
-    a stale one behind.
+    move an existing event
+
+    patch replaces the whole start/end objects, so switching a timed event to
+    all day drops its dateTime instead of leaving a stale one
     """
     event = await _execute(service.events().patch(
         calendarId=CALENDAR_ID,
@@ -161,14 +170,11 @@ async def find_conflicting_events(
     exclude_event_ids: set[str] | None = None,
 ) -> list[dict]:
     """
-    Existing events that overlap [start_dt, end_dt).
+    existing events overlapping [start_dt, end_dt)
 
-    Google's timeMin/timeMax filter already means "overlaps this range", so the
-    remaining work is dropping things that aren't real clashes: all-day events,
-    slots the user marked free, and invites they declined.
-
-    exclude_event_ids keeps a reschedule from finding the event it's moving and
-    reporting it as a clash with itself.
+    google's timeMin/timeMax already means "overlaps this range", the rest is
+    dropping non clashes: free slots and declined invites
+    exclude_event_ids stops a reschedule clashing with the event it is moving
     """
     excluded = exclude_event_ids or set()
     result = await _execute(service.events().list(
@@ -186,13 +192,12 @@ async def find_conflicting_events(
             continue
         if event.get("status") == "cancelled":
             continue
-        # All-day events count. A trip or a day off is a real reason not to
-        # book something, and the transparency check below is what keeps
-        # birthdays and holidays out — those are marked free, and imported
-        # ones live on their own calendars rather than "primary" anyway
+        # all day events count, a trip or a day off is a real reason not to book
+        # the transparency check is what keeps birthdays and holidays out, those
+        # are marked free and imported ones live on their own calendars
         if event.get("transparency") == "transparent":
             continue
-        # An invite the user declined isn't holding the slot
+        # a declined invite is not holding the slot
         if any(
             a.get("self") and a.get("responseStatus") == "declined"
             for a in event.get("attendees", [])
@@ -230,7 +235,7 @@ async def create_event(
     if description: body["description"] = description
 
     event = await _execute(service.events().insert(calendarId=CALENDAR_ID, body=body))
-    logger.info(f"Created event: {event['id']} — {title}")
+    logger.info(f"Created event: {event['id']} - {title}")
     return event
 
 
@@ -251,10 +256,11 @@ async def list_events(
     max_results: int = 40,
 ) -> list[dict]:
     """
-    Everything on the calendar in a window. Deliberately does no keyword
-    filtering of its own — the model reads the list and decides what matches.
-    Substring matching on a title the user never types exactly is what made
-    "office day saturday" fail to find "Office Day".
+    everything in a window
+
+    no keyword filtering of its own, the model reads the list and decides
+    substring matching on a title nobody types exactly is what made
+    "office day saturday" fail to find "Office Day"
     """
     params = {
         "calendarId": CALENDAR_ID,
@@ -273,15 +279,19 @@ async def list_events(
 
 def summarize_event(event: dict) -> dict:
     """
-    An event flattened for the model to reason over. The weekday is spelled out
-    because users say "saturday's office event", not a date.
+    one event flattened for the model, weekday spelled out because people say
+    "saturday's office event", not a date
+
+    title and location get scrubbed, anyone can put an event on a primary
+    calendar by sending an invite, so those two are where third party text
+    enters the agent's context
     """
     date_str, start_time, duration, all_day = read_event_window(event)
     day = datetime.fromisoformat(date_str).strftime("%A %b %d").lower()
 
     summary = {
         "id": event["id"],
-        "title": event.get("summary") or "untitled",
+        "title": scrub(event.get("summary")) or "untitled",
         "day": day,
         "date": date_str,
         "all_day": all_day,
@@ -290,20 +300,48 @@ def summarize_event(event: dict) -> dict:
         summary["start"] = start_time
         summary["duration_minutes"] = duration
     if event.get("location"):
-        summary["location"] = event["location"]
+        summary["location"] = scrub(event["location"])
     if event.get("recurringEventId"):
-        # Only the next few occurrences are shown, so say it repeats rather
-        # than let the model conclude those are all of them
+        # only the next few occurrences are shown, so say it repeats instead of
+        # letting the model conclude those are all of them
         summary["repeats"] = True
     return summary
 
 
-async def update_event_reminders(service, event_ids: list[str], reminder_minutes_list: list[int]) -> int:
+def build_reminder_overrides(reminder_minutes_list: list[int]) -> tuple[list[dict], list[int]]:
+    """
+    (overrides, offsets actually applied), never over google's cap of five
+
+    two offsets fit with popup and email, past that the email copy goes so up to
+    five distinct times still land, past five the extras get cut
+    caller gets the applied list so it can say what really happened
+    """
+    offsets = sorted({m for m in reminder_minutes_list if m >= 0}, reverse=True)
+
+    methods = ("popup", "email") if len(offsets) * 2 <= MAX_REMINDER_OVERRIDES else ("popup",)
+    applied = offsets[: MAX_REMINDER_OVERRIDES // len(methods)]
+
     overrides = [
-        {"method": m, "minutes": mins}
-        for mins in reminder_minutes_list
-        for m in ("popup", "email")
+        {"method": method, "minutes": minutes}
+        for minutes in applied
+        for method in methods
     ]
+    return overrides, applied
+
+
+async def update_event_reminders(
+    service,
+    event_ids: list[str],
+    reminder_minutes_list: list[int],
+) -> tuple[int, list[int]]:
+    """patch reminders onto each event, returns (updated count, offsets applied)"""
+    overrides, applied = build_reminder_overrides(reminder_minutes_list)
+    if not overrides:
+        return 0, []
+
+    if len(applied) < len({m for m in reminder_minutes_list if m >= 0}):
+        logger.info(f"Trimmed reminder offsets to {applied} to stay under Google's cap")
+
     body = {"reminders": {"useDefault": False, "overrides": overrides}}
     updated = 0
 
@@ -319,4 +357,4 @@ async def update_event_reminders(service, event_ids: list[str], reminder_minutes
         except HttpError as e:
             logger.error(f"Failed to patch {event_id}: {e}")
 
-    return updated
+    return updated, applied

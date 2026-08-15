@@ -1,6 +1,6 @@
 """
-Async database connection via SQLAlchemy + asyncpg.
-Connects to Supabase Postgres via DATABASE_URL env var.
+async db connection, sqlalchemy + asyncpg
+supabase postgres via DATABASE_URL
 """
 
 import os
@@ -10,12 +10,18 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 DATABASE_URL = os.environ["DATABASE_URL"]  # postgresql+asyncpg://...
 DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-# Connection pool tuned for a small SaaS — adjust as you scale
+# pool is per process, real ceiling is this times replica count
+# hardcoded 10/20 put two replicas at 60 connections, the direct connection limit
+# on a small postgres, so the third replica could not connect
+# from env so it scales down as replicas scale up
+POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "10"))
+MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "20"))
+
 engine = create_async_engine(
     DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,  # detect stale connections
+    pool_size=POOL_SIZE,
+    max_overflow=MAX_OVERFLOW,
+    pool_pre_ping=True,  # catch stale connections
     echo=False,
 )
 
@@ -28,7 +34,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 @asynccontextmanager
 async def get_db():
-    """Context manager that yields a db session and always closes it."""
+    """yields a session, commits on exit, rolls back and reraises on error"""
     async with AsyncSessionLocal() as session:
         try:
             yield session

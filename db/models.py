@@ -1,7 +1,7 @@
 """
-Database models. Two tables: users and messages.
-Users are keyed by phone number — that's how we identify who's texting us.
-Messages are the conversation transcript, so the agent has context on follow-ups.
+db models
+users, messages, reminder claims, parked confirmations, oauth nonces
+users keyed by phone number, that is the identity
 """
 
 from datetime import datetime, timezone
@@ -18,16 +18,22 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
 
-    # E.164 phone number, e.g. "+12015551234"
+    # e.164, e.g. "+12015551234"
     phone_number = Column(String(20), primary_key=True, index=True)
 
-    # Google OAuth tokens (encrypted at rest via Supabase column encryption)
+    # google refresh token, encrypted app side when TOKEN_ENCRYPTION_KEY is set
+    # see db/repo.py. rows written before the key are plaintext, so both shapes
+    # must read back. a dump of this column is permanent calendar access
     google_refresh_token = Column(Text, nullable=True)
     google_email = Column(String(255), nullable=True)
 
-    # Lifecycle
+    # "sms" | "whatsapp", last channel used
+    # reminders are the biggest outbound volume, whatsapp is the cheaper path
+    channel = Column(String(16), nullable=True)
+
+    # lifecycle
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    onboarded_at = Column(DateTime(timezone=True), nullable=True)  # set when OAuth completes
+    onboarded_at = Column(DateTime(timezone=True), nullable=True)  # set when oauth completes
 
     @property
     def is_onboarded(self) -> bool:
@@ -36,15 +42,14 @@ class User(Base):
 
 class Message(Base):
     """
-    One row per conversation turn, user or assistant.
-    Read back on the next text so the agent can resolve follow-ups
-    like "make it 3pm instead" or answers to a question it just asked.
+    one row per conversation turn, user or assistant
+    read back next text so the agent can resolve follow ups like "make it 3pm instead"
     """
 
     __tablename__ = "messages"
 
-    # BIGSERIAL on Postgres. sqlite only autoincrements plain INTEGER pks,
-    # so use the variant there — lets the model run under a sqlite test db.
+    # bigserial on postgres, plain integer on sqlite
+    # sqlite only autoincrements integer pks, variant keeps a sqlite test db working
     id = Column(
         BigInteger().with_variant(Integer, "sqlite"),
         primary_key=True,
@@ -57,7 +62,7 @@ class Message(Base):
         nullable=False,
     )
 
-    # "user" or "assistant" — matches the Anthropic messages format
+    # "user" or "assistant", matches the anthropic messages format
     role = Column(String(16), nullable=False)
     content = Column(Text, nullable=False)
 
@@ -67,7 +72,7 @@ class Message(Base):
         nullable=False,
     )
 
-    # History is always read as "latest N for this phone", so index that pair
+    # history is always read as "latest n for this phone", so index the pair
     __table_args__ = (
         Index("ix_messages_phone_created", "phone_number", "created_at"),
     )
@@ -75,10 +80,9 @@ class Message(Base):
 
 class SentReminder(Base):
     """
-    One row per reminder actually sent. The primary key is what makes sending
-    idempotent: every worker running the sweep tries to insert first and only
-    texts if the insert won, so two workers can't both remind about the same
-    event, and a restart mid-sweep can't send twice.
+    one row per reminder sent, the pk is the idempotency lock
+    workers insert first and only text if the insert won, so no double sends
+    row is released again if the send fails
     """
 
     __tablename__ = "sent_reminders"
@@ -100,14 +104,10 @@ class SentReminder(Base):
 
 class PendingConfirmation(Base):
     """
-    An event creation that clashed with something already on the calendar and
-    is parked waiting on a yes/no. At most one per user — a newer clash
-    replaces the old one.
+    a write parked waiting on a yes/no, at most one per user, newest wins
 
-    This is its own table rather than columns on `users` on purpose: the app
-    builds schema with metadata.create_all, which creates missing tables but
-    will NOT add columns to a table that already exists. Columns on `users`
-    would need a hand-written migration against the live database.
+    own table not columns on users on purpose: create_all makes missing tables
+    but never adds columns to an existing one
     """
 
     __tablename__ = "pending_confirmations"
@@ -118,8 +118,32 @@ class PendingConfirmation(Base):
         primary_key=True,
     )
 
-    # JSON of the create_calendar_event args, replayed verbatim on confirm
+    # json of the tool args, replayed verbatim on confirm
     event_json = Column(Text, nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class OAuthState(Base):
+    """
+    single use nonce for one outstanding google auth link
+
+    without it the state param is a permanent bearer token, anyone holding the
+    url can bind their own number to whichever google account signs in
+    consuming the row makes a link work once, the timestamp expires it
+    """
+
+    __tablename__ = "oauth_states"
+
+    nonce = Column(String(64), primary_key=True)
+
+    # not a foreign key on purpose, a cascade from users would kill an in flight
+    # link if the account got cleared mid auth
+    phone_number = Column(String(20), nullable=False)
 
     created_at = Column(
         DateTime(timezone=True),
