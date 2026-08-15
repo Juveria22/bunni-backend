@@ -105,3 +105,33 @@ def test_init_with_an_unusable_dsn_does_not_raise(monkeypatch):
     """a broken monitoring config must never stop the app booting"""
     monkeypatch.setenv("SENTRY_DSN", "not-a-valid-dsn")
     monitoring.init_monitoring()   # must not raise
+
+
+def test_a_dsn_without_the_package_installed_does_not_raise(monkeypatch):
+    """
+    sentry-sdk is deliberately not in requirements.txt, so setting a DSN
+    without installing it is the likely mistake. it must degrade to counters,
+    not crash the boot
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_sentry(name, *args, **kwargs):
+        if name == "sentry_sdk":
+            raise ImportError("No module named 'sentry_sdk'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setenv("SENTRY_DSN", "https://key@o1.ingest.sentry.io/1")
+    monkeypatch.setattr(builtins, "__import__", no_sentry)
+
+    monitoring.init_monitoring()   # must not raise
+    assert monitoring._sentry is None
+
+
+def test_counters_work_with_no_sentry_at_all():
+    """the default setup: nothing installed, nothing configured"""
+    assert monitoring._sentry is None
+    report("reply.delivery_failed", RuntimeError("twilio down"))
+    count("reminder.sent", 2)
+    assert snapshot() == {"reply.delivery_failed": 1, "reminder.sent": 2}

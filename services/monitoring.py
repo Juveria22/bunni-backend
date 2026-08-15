@@ -6,10 +6,13 @@ send that always fails, a cache that never engages, a token that can no longer
 be decrypted: none of those raise anything a person sees, they just show up on
 the bill or in a complaint weeks later
 
-two halves, and the counters are the half that always works:
-  counters   in process, always on, summarised on a heartbeat so a run of
-             failures cannot pass unnoticed even with no external service
-  sentry     optional, set SENTRY_DSN. gives stack traces and alerting
+the counters are the whole thing by default. nothing to install, no account,
+no setup: every failure is tallied and the heartbeat prints the window even
+when it is empty, so silence means the loop died rather than that all is well
+
+sentry is a hook, not a requirement. the package is deliberately not in
+requirements.txt. set SENTRY_DSN and install sentry-sdk if you ever want stack
+traces and alerting instead of reading logs
 
 nothing here may raise. monitoring that can take the request down is worse than
 no monitoring
@@ -61,7 +64,8 @@ def init_monitoring() -> None:
 
     dsn = os.environ.get("SENTRY_DSN", "").strip()
     if not dsn:
-        logger.info("SENTRY_DSN not set, error monitoring is counters and logs only")
+        # the expected case, not a degraded one
+        logger.info("Error monitoring: counters and heartbeat (SENTRY_DSN unset)")
         return
 
     try:
@@ -77,6 +81,14 @@ def init_monitoring() -> None:
         )
         _sentry = sentry_sdk
         logger.info("Sentry error monitoring enabled")
+    except ImportError:
+        # dsn set but the package was never installed, which is the likely
+        # mistake given it is not in requirements.txt
+        logger.error(
+            "SENTRY_DSN is set but sentry-sdk is not installed. "
+            "Run `pip install sentry-sdk`, or unset the DSN. "
+            "Counters and the heartbeat are unaffected"
+        )
     except Exception as e:
         # a broken monitoring config must never stop the app booting
         logger.error(f"Could not start Sentry, continuing without it: {e}")

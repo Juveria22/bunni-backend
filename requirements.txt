@@ -18,6 +18,7 @@ python-multipart==0.0.12
 httpx==0.27.2
 cryptography==43.0.1
 
-# error monitoring. inert unless SENTRY_DSN is set, the in-process counters and
-# the heartbeat in services/monitoring.py work either way
-sentry-sdk[fastapi]==2.18.0
+# no sentry package on purpose. error monitoring is the counters and the
+# heartbeat in services/monitoring.py, which need nothing installed and no
+# account. if you ever want stack traces and alerting instead of reading logs,
+# pip install sentry-sdk and set SENTRY_DSN, and the hook there picks it up
