@@ -1,0 +1,5 @@
+# test-only, kept out of requirements.txt so production installs stay lean
+-r requirements.txt
+
+pytest==8.3.3
+pytest-asyncio==0.24.0
