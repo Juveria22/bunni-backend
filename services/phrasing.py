@@ -100,6 +100,73 @@ def fmt_all_day_reminder(minutes: int) -> str:
     return f"{fmt_reminder(minutes)} before"
 
 
+# a confirmation naming eight addresses is several segments, and the count is
+# what actually answers "who am i inviting"
+MAX_GUESTS_NAMED = 2
+
+
+def fmt_guest_list(emails: list[str]) -> str:
+    """
+    jake@x.com, or jake@x.com and 2 others
+
+    addresses are long and this goes into a yes/no question, so past a couple
+    the rest are counted. the count is always true, naming two of five and
+    saying nothing about the rest would let someone confirm a wider invite than
+    they realised
+    """
+    named = [scrub(e, limit=60) for e in emails[:MAX_GUESTS_NAMED]]
+    rest = len(emails) - len(named)
+
+    if not named:
+        return "them"
+    if rest:
+        return f"{', '.join(named)} and {rest} other{'s' if rest > 1 else ''}"
+    if len(named) == 2:
+        return f"{named[0]} and {named[1]}"
+    return named[0]
+
+
+def fmt_detail_changes(changes: dict) -> str:
+    """
+    the "what changed" tail of an update reply, in a fixed order
+
+    only the keys present are mentioned, so someone who asked for one thing is
+    not read a list of five. a cleared field says so rather than going quiet,
+    "removed" and "unchanged" look identical from the outside otherwise
+    """
+    parts = []
+
+    if "location" in changes:
+        # scrubbed like every other string that ends up in an sms, a pasted
+        # address can carry newlines and this is the only place it goes out
+        where = scrub(changes["location"])
+        parts.append(f"location now {where}" if where else "location removed")
+
+    if "description" in changes:
+        parts.append("note updated" if changes["description"] else "note removed")
+
+    if "color" in changes:
+        # the word they used, not google's name for it, "color now tomato" when
+        # they asked for red reads like it did something else
+        parts.append(f"color now {changes['color']}")
+
+    if "busy" in changes:
+        parts.append(
+            "marked busy" if changes["busy"]
+            else "marked free so it wont block new stuff"
+        )
+
+    if "visibility" in changes:
+        visibility = changes["visibility"]
+        parts.append(
+            "set to private" if visibility == "private"
+            else "set to public" if visibility == "public"
+            else "visibility back to default"
+        )
+
+    return ", ".join(parts)
+
+
 def fmt_time(hhmm: str) -> str:
     """15:30 -> 3:30pm, returns the input unchanged if it will not parse"""
     try:

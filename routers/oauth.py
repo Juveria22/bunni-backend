@@ -57,7 +57,7 @@ ERROR_HTML = """
 <head><title>error</title></head>
 <body style="font-family:system-ui;text-align:center;padding:4rem">
   <h1>something went wrong</h1>
-  <p>close this and text the agent again to get a new link.</p>
+  <p>close this and text bunni again to get a new link.</p>
 </body>
 </html>
 """
@@ -71,7 +71,7 @@ EXPIRED_HTML = """
 <body style="font-family:system-ui;text-align:center;padding:3rem;max-width:26rem;margin:0 auto">
   <h1 style="font-size:1.4rem">this link has expired</h1>
   <p style="color:#666">setup links work once and only for a few minutes.</p>
-  <p style="color:#666">text the agent again for a fresh one.</p>
+  <p style="color:#666">text bunni again for a fresh one.</p>
 </body>
 </html>
 """
@@ -86,9 +86,9 @@ NO_REFRESH_TOKEN_HTML = """
 <body style="font-family:system-ui;text-align:center;padding:3rem;max-width:26rem;margin:0 auto">
   <h1 style="font-size:1.4rem">almost there</h1>
   <p style="color:#666">google didn't give us permission to manage your calendar later on.</p>
-  <p style="color:#666">remove gcal at
+  <p style="color:#666">remove bunni at
     <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>,
-    then text the agent for a fresh link.</p>
+    then text bunni for a fresh link.</p>
 </body>
 </html>
 """

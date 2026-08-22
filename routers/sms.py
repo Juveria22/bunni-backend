@@ -135,7 +135,7 @@ def _parse_channel(from_field: str) -> tuple[str, str]:
     return from_field, "sms"
 
 
-ONBOARDING_MSG = "heyy\n\ngcal setup: {auth_url}"
+ONBOARDING_MSG = "heyy\n\nbunni setup: {auth_url}"
 
 
 def _twiml(body: str | None, channel: str) -> PlainTextResponse:

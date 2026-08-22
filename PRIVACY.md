@@ -1,10 +1,10 @@
 # Privacy Policy
 
-**Last updated: August 13, 2026**
+**Last updated: August 19, 2026**
 
 ## Overview
 
-gcal agent ("we", "us", "our") operates an AI-powered calendar assistant that you use by text message. This policy explains how we collect, use, and protect your information.
+bunni ("we", "us", "our") operates an AI-powered calendar assistant that you use by text message. This policy explains how we collect, use, and protect your information.
 
 ## Information We Collect
 
@@ -17,6 +17,7 @@ gcal agent ("we", "us", "our") operates an AI-powered calendar assistant that yo
 ## How We Use Your Information
 
 - To create, update, and manage your Google Calendar events
+- To invite people to your events, when you ask us to and give us their email address
 - To send you confirmations and reminders about upcoming events
 - To identify you across messages, so a follow-up like "make it 3pm instead" works
 
@@ -28,15 +29,15 @@ We also store the messages you exchange with us — your texts and our replies �
 
 **Calendar content.** We do not keep a copy of your calendar. Your events are read from Google when we need them and are not retained afterwards. Two narrow exceptions:
 
-- When we ask you to confirm something ("delete dentist?", "you already have standup then, still add lunch?"), the event's name and time are held for up to 30 minutes so we can carry out exactly what you agreed to. It is deleted once you answer, or when it expires.
-- Our replies to you often mention an event by name, and those replies are stored in your message history under the 7-day rule above.
+- When we ask you to confirm something ("delete dentist?", "you already have standup then, still add lunch?"), the event's name and time are held for up to 30 minutes so we can carry out exactly what you agreed to. If you are inviting someone, the address you gave us is held the same way. It is deleted once you answer, or when it expires.
+- Our replies to you often mention an event by name, and those replies are stored in your message history under the 7-day rule above. A guest's email address appears there too when you invite them, because we read the address back to you before sending anything.
 
 ## Data Sharing
 
 We do not sell, trade, or share your personal information with third parties except:
 
-- **Anthropic** — Claude AI processes the text you send us in order to understand your request. It also receives the names, times, and locations of the calendar events relevant to that request, and the name and location of an event we are about to remind you about. Anthropic does not receive your phone number or your Google account email.
-- **Google** — your calendar is read and written via the Google Calendar API.
+- **Anthropic** — Claude AI processes the text you send us in order to understand your request. It also receives the names, times, and locations of the calendar events relevant to that request, and the name and location of an event we are about to remind you about. If you ask about an event's notes or who is invited to it, that one event's description and guest email addresses are sent as well — only for the event you asked about, and only on the request that asked. Anthropic does not receive your phone number or your Google account email.
+- **Google** — your calendar is read and written via the Google Calendar API. When you invite someone to an event, Google sends them an invitation email on your behalf, which shows them the event and that you invited them.
 - **Twilio** — your phone number is used to send and receive messages.
 
 We do not share your mobile number with third parties for marketing purposes.

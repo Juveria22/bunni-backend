@@ -73,3 +73,45 @@ class FakeUser:
 async def fake_get_db():
     """The handler only passes the session through to patched repo calls."""
     yield object()
+
+
+class FakeCalendar:
+    """
+    Enough of the google client for the write path: service.events().patch(...).execute()
+
+    Records every body it is handed, because what actually reaches google is the
+    thing worth asserting on. Real client, real _execute, only the transport is fake.
+    """
+
+    def __init__(self, event=None):
+        self.event = event or {}
+        self.patched: list[dict] = []
+        self.deleted: list[str] = []
+
+    def events(self):
+        return self
+
+    def patch(self, calendarId=None, eventId=None, body=None, sendUpdates=None):
+        self.patched.append({"event_id": eventId, "body": body, "sendUpdates": sendUpdates})
+        return _FakeRequest({**self.event, **(body or {})})
+
+    def get(self, calendarId=None, eventId=None):
+        return _FakeRequest(self.event)
+
+    def delete(self, calendarId=None, eventId=None):
+        self.deleted.append(eventId)
+        return _FakeRequest({})
+
+    @property
+    def last_body(self):
+        return self.patched[-1]["body"]
+
+
+class _FakeRequest:
+    """the google client is sync and lazy, .execute() is where the call happens"""
+
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result

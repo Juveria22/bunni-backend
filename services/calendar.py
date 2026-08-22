@@ -6,6 +6,7 @@ also owns the timezone and the date/time math the agent reasons over
 
 import asyncio
 import logging
+import re
 from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -26,6 +27,77 @@ ALL_DAY_REMINDER_MINUTES = 900
 # we emit popup + email per offset, so three offsets made six and the patch
 # failed with a generic error that retrying could never fix
 MAX_REMINDER_OVERRIDES = 5
+
+# google's own limits, a body over them is a 400 that retrying cannot fix
+# an inbound sms is capped well under these anyway, they are here so a long
+# whatsapp paste or a pasted itinerary gets trimmed instead of rejected
+MAX_TITLE_CHARS = 1024
+MAX_LOCATION_CHARS = 1024
+MAX_DESCRIPTION_CHARS = 8192
+
+# the eleven event colours google actually has, keyed by what someone would
+# text. the numeric ids are google's, the first eleven names are google's own,
+# the rest are the words real people use for them
+#
+# nobody says "set it to tangerine", they say orange, and a model asked for a
+# raw colorId guesses numbers
+EVENT_COLORS = {
+    "lavender": "1",
+    "sage": "2",
+    "grape": "3",
+    "flamingo": "4",
+    "banana": "5",
+    "tangerine": "6",
+    "peacock": "7",
+    "graphite": "8",
+    "blueberry": "9",
+    "basil": "10",
+    "tomato": "11",
+    "red": "11",
+    "orange": "6",
+    "yellow": "5",
+    "green": "10",
+    "light green": "2",
+    "mint": "2",
+    "blue": "9",
+    "light blue": "7",
+    "teal": "7",
+    "turquoise": "7",
+    "cyan": "7",
+    "purple": "3",
+    "violet": "3",
+    "pink": "4",
+    "grey": "8",
+    "gray": "8",
+    "silver": "8",
+}
+
+# the eleven above offered to the model as one word each, so the enum covers
+# google's whole palette without asking it to choose between synonyms
+COLOR_CHOICES = (
+    "red", "orange", "yellow", "green", "light green",
+    "blue", "light blue", "purple", "lavender", "pink", "grey",
+)
+
+# what a user may ask an event to be, google's own vocabulary is default/public/private
+VISIBILITY_OPTIONS = ("default", "public", "private")
+
+# a description is read on demand and never rides along in a find_events row,
+# but it is still third party text, so it gets a cap of its own. long enough for
+# a real note, short enough that a pasted invite footer cannot fill the context
+MAX_DESCRIPTION_READ_CHARS = 600
+
+# guests are listed for the model only when it asks for them, and a party of
+# forty is not something anyone manages over sms
+MAX_GUESTS_LISTED = 20
+
+# one invite at a time is one confirmation at a time, and every guest is an
+# email google sends on the user's behalf
+MAX_GUESTS_PER_INVITE = 10
+
+# deliberately loose, this only has to reject a name the model invented an
+# address out of. google is the real validator
+_EMAIL = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[a-z]{2,}$", re.IGNORECASE)
 
 
 async def _execute(request):
@@ -160,6 +232,173 @@ async def update_event_time(
     ))
     logger.info(f"Moved event {event_id} to {date} {start_time or '(all day)'}")
     return event
+
+
+def resolve_color(name: str | None) -> str | None:
+    """
+    a colour word to google's colorId, None if it is not one of the eleven
+
+    None means "say so", not "leave it alone". silently dropping an unrecognised
+    colour tells the user it worked when nothing changed
+    """
+    if not name:
+        return None
+    return EVENT_COLORS.get(" ".join(name.lower().split()))
+
+
+def build_details_body(
+    title: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    color_id: str | None = None,
+    busy: bool | None = None,
+    visibility: str | None = None,
+) -> dict:
+    """
+    the patch body for everything about an event that is not its time
+
+    None means leave the field alone, "" means take it off the event. that
+    distinction is the whole interface: a patch carrying "location": "" clears
+    it, a patch with no location key at all keeps whatever is there
+    """
+    body: dict = {}
+
+    if title is not None:
+        body["summary"] = title[:MAX_TITLE_CHARS]
+    if description is not None:
+        body["description"] = description[:MAX_DESCRIPTION_CHARS]
+    if location is not None:
+        body["location"] = location[:MAX_LOCATION_CHARS]
+    if color_id is not None:
+        body["colorId"] = color_id
+    if busy is not None:
+        # free events are skipped by the clash check, so this is the switch that
+        # stops a standing gym block asking a question every time you book over it
+        body["transparency"] = "opaque" if busy else "transparent"
+    if visibility is not None:
+        body["visibility"] = visibility
+
+    return body
+
+
+async def update_event_details(service, event_id: str, **fields) -> dict:
+    """
+    change what an event is, never when it is
+
+    patch and not update, so the fields nobody mentioned keep their values and
+    the start/end objects are not touched at all
+    """
+    body = build_details_body(**fields)
+    if not body:
+        return {}
+
+    event = await _execute(service.events().patch(
+        calendarId=CALENDAR_ID,
+        eventId=event_id,
+        body=body,
+    ))
+    logger.info(f"Updated {sorted(body)} on event {event_id}")
+    return event
+
+
+# colour word to show a colour back with, first spelling in COLOR_CHOICES wins so
+# an event set to tomato reads back as red, the word they used to set it
+_COLOR_NAMES: dict[str, str] = {}
+for _name in COLOR_CHOICES:
+    _COLOR_NAMES.setdefault(EVENT_COLORS[_name], _name)
+
+
+def looks_like_email(value: str | None) -> bool:
+    """
+    is this an address google could actually invite
+
+    the failure this catches is a model turning "invite jake" into jake@gmail.com
+    because it needed something to send. a wrong address invites a stranger
+    """
+    return bool(value and _EMAIL.match(value.strip()))
+
+
+def merge_guests(event: dict, emails: list[str]) -> tuple[list[dict], list[str]]:
+    """
+    (full attendee list to write, the addresses that are actually new)
+
+    patching attendees replaces the whole array, so everyone already on the
+    event has to be carried over or they are uninvited by the write. the existing
+    entries go back verbatim, rebuilding them from the address alone would reset
+    everyone's rsvp to needsAction
+    """
+    existing = [a for a in event.get("attendees", []) if a.get("email")]
+    known = {a["email"].strip().lower() for a in existing}
+
+    added = []
+    for email in emails:
+        clean = email.strip()
+        if clean.lower() in known:
+            continue
+        known.add(clean.lower())
+        added.append(clean)
+
+    return existing + [{"email": e} for e in added], added
+
+
+async def add_event_guests(service, event_id: str, attendees: list[dict]) -> dict:
+    """
+    put guests on an event and let google send the invitations
+
+    sendUpdates=all is the whole point, an attendee added silently never finds
+    out they were invited. it is also why this always gets confirmed first
+    """
+    event = await _execute(service.events().patch(
+        calendarId=CALENDAR_ID,
+        eventId=event_id,
+        body={"attendees": attendees},
+        sendUpdates="all",
+    ))
+    logger.info(f"Added {len(attendees)} attendee(s) to event {event_id}")
+    return event
+
+
+def read_event_extras(event: dict) -> dict:
+    """
+    the parts of an event find_events deliberately leaves out
+
+    a note and a guest list are the two heaviest fields on an event and the two
+    least often needed, so they are fetched for one event when asked for rather
+    than carried on every row of every search
+
+    the description is where a meeting invite puts its links and its boilerplate,
+    which makes it the richest place for injected text on the whole event, hence
+    the cap and the scrub
+    """
+    extras: dict = {
+        "id": event.get("id"),
+        "title": scrub(event.get("summary")) or "untitled",
+    }
+
+    description = scrub(event.get("description"), limit=MAX_DESCRIPTION_READ_CHARS)
+    extras["description"] = description or None
+
+    if event.get("location"):
+        extras["location"] = scrub(event["location"])
+
+    guests = [
+        {
+            "email": a["email"],
+            "status": a.get("responseStatus", "needsAction"),
+            **({"self": True} if a.get("self") else {}),
+        }
+        for a in event.get("attendees", [])
+        if a.get("email") and not a.get("resource")
+    ]
+    if guests:
+        extras["guests"] = guests[:MAX_GUESTS_LISTED]
+        extras["guest_count"] = len(guests)
+
+    if event.get("colorId"):
+        extras["color"] = _COLOR_NAMES.get(event["colorId"], "default")
+    extras["busy"] = event.get("transparency") != "transparent"
+
+    return extras
 
 
 async def find_conflicting_events(
@@ -301,6 +540,11 @@ def summarize_event(event: dict) -> dict:
         summary["duration_minutes"] = duration
     if event.get("location"):
         summary["location"] = scrub(event["location"])
+    if event.get("transparency") == "transparent":
+        # only sent when it is free, which is the unusual case. a free event is
+        # invisible to the clash check, so the model needs it to answer "does
+        # that block anything" and to not re-free something already free
+        summary["busy"] = False
     if event.get("recurringEventId"):
         # only the next few occurrences are shown, so say it repeats instead of
         # letting the model conclude those are all of them

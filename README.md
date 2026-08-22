@@ -2,9 +2,6 @@
 
 Text a number in plain English, and your Google Calendar does what you meant.
 
-> Note: `PRIVACY.md` and `TERMS.md` refer to this service as "gcal agent". Pick one
-> name and make it consistent — the legal docs are the user-facing ones.
-
 Managing a calendar from a phone is annoying. The point of this service is that
 you send something short and sloppy — "dentist friday at 3", "move saniyahs
 party to noon", "office day*" — and it is handled, without being asked to
@@ -14,10 +11,19 @@ repeat yourself or spell anything exactly.
 
 ## what it does
 
-**Manages events by text.** Create, reschedule, delete, and change reminders,
-in natural language. The agent reads the actual calendar before acting, so it
-resolves things like "the saturday one" or "the 11-6 one" against what is really
-there rather than guessing.
+**Manages events by text.** Create, reschedule, delete, rename, and edit
+anything an event carries — its note, location, colour, reminders, and whether
+it blocks the slot as busy — in natural language. Editing patches the event in
+place rather than replacing it, so its id, its guests and its history survive.
+The agent reads the actual calendar before acting, so it resolves things like
+"the saturday one" or "the 11-6 one" against what is really there rather than
+guessing.
+
+**Invites people, once you have said yes.** Guests are the one write that leaves
+your own calendar — Google emails a third party on your behalf and there is no
+unsending it. So an address is always read back and confirmed before anything is
+sent, and the agent is required to ask you for an address it does not have
+rather than assemble one out of a name.
 
 **Texts you before things happen.** Every timed event gets a text about an hour
 ahead and again as it starts. This is the part Google doesn't do well — its own
@@ -42,8 +48,10 @@ way you came in.
 Twilio ──► POST /message
              │
              ├─ verify Twilio signature ──────────── reject if unsigned
+             ├─ duplicate delivery? ──────────────── twilio redelivery, stay silent
              ├─ STOP / HELP keywords ─────────────── handled and returned
              ├─ rate limit (30/user/hour) ────────── first refusal answers, rest silent
+             ├─ monthly spend ceiling ────────────── one notice a day, then silent
              ├─ not onboarded? ───────────────────── reply with a one-use OAuth link
              │
              └─ hand off, return empty 200 immediately
@@ -55,8 +63,8 @@ Twilio ──► POST /message
          yes               no
           │                 │
    replay the exact    Claude tool loop:
-   action shown to     find_events ─► create / reschedule
-   the user            delete / update_reminders
+   action shown to     find_events / read_details ─► create / reschedule
+   the user            edit details / invite guests / delete / update_reminders
           │                 │
           └────────┬────────┘
                    ▼
@@ -76,18 +84,25 @@ same text, and sends it.
 ## the trust boundary
 
 Anyone can put an event on someone's Google calendar by sending an invite, so
-event titles and locations are attacker-controlled text that ends up in two
-sensitive places: the agent's context, and the body of a text sent from a number
-the user trusts.
+event titles, locations and descriptions are attacker-controlled text that ends
+up in two sensitive places: the agent's context, and the body of a text sent
+from a number the user trusts.
 
-Three things hold that line. Titles and locations are stripped of newlines and
+Three things hold that line. Untrusted strings are stripped of newlines and
 control characters and capped in length before they go anywhere. Tool results
 are labelled as data rather than instructions, and the system prompt says so.
 Anything that reads like an instruction, a link, or a phone number forces a
 confirmation before a write, and drops the reminder writer to a fixed template.
 
-Delete-always-confirms is the only unconditional guarantee; the rest is defence
-in depth.
+Descriptions are the widest door of the three, because a meeting invite puts
+paragraphs of someone else's writing there. So they are never carried on a
+search result — the agent has to ask for one event's note deliberately, and
+having read a note that reads like an instruction arms the confirmation for the
+rest of that turn: the write still happens, but only after the user has seen
+which event it lands on.
+
+Delete-always-confirms and invite-always-confirms are the unconditional
+guarantees; the rest is defence in depth.
 
 ---
 
@@ -124,12 +139,15 @@ services/
   sanitize.py               untrusted-text scrubbing, injection heuristics, masking
   sms.py                    outbound twilio, GSM-7 substitution, length clamp
   rate_limit.py             redis fixed-window limiter, in-process fallback
+  budget.py                 global monthly spend ceiling across all users
+  monitoring.py             failure counters, heartbeat, optional sentry hook
   redis_client.py           shared connection, distributed lock
 db/
   models.py                 5 tables: users, messages, sent_reminders,
                             pending_confirmations, oauth_states
   session.py                async engine and pooling
   repo.py                   every query, plus refresh-token encryption
+tests/                      pytest suite, fakes for twilio, google and redis
 ```
 
 ---

@@ -51,7 +51,7 @@ def scrub(value: str | None, limit: int = MAX_UNTRUSTED_CHARS) -> str:
 
 def mask_phone(phone: str | None) -> str:
     """
-    a phone number cut down to what a human needs to recognise it, no more
+    a phone number cut down to what a person needs to recognise it, no more
 
     used for logs, which have no retention window and sit outside STOP, and for
     the oauth success page, where the point is telling at a glance whether the
